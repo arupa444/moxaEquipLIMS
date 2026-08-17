@@ -1,0 +1,16 @@
+.env
+*.db
+*.db-wal
+*.db-shm
+__pycache__/
+.venv/
+records/
+records_raw/
+sessions/
+capture*.log
+
+.DS_Store
+.idea/
+.env.*
+!.env.example
+sessions_t/

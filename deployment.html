@@ -1,0 +1,301 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Multi-Balance Deployment Architecture</title>
+<style>
+@page { size: A4; margin: 16mm; }
+body { font: 11pt/1.5 -apple-system, Helvetica, Arial, sans-serif; color:#111; }
+h1 { font-size: 20pt; margin: 0 0 4pt; letter-spacing:-.3pt }
+h2 { font-size: 14pt; margin: 20pt 0 6pt; border-bottom:1.5pt solid #333; padding-bottom:3pt }
+h3 { font-size: 11.5pt; margin: 13pt 0 4pt }
+.sub { color:#555; margin:0 0 14pt; font-size:10pt }
+table { border-collapse: collapse; width:100%; margin:8pt 0; font-size:9.5pt }
+th,td { border:0.6pt solid #aaa; padding:4pt 6pt; text-align:left; vertical-align:top }
+th { background:#eee; font-weight:700 }
+code,.mono { font-family: "SF Mono", Menlo, monospace; font-size:9pt }
+pre { background:#f4f4f6; border:0.6pt solid #ccc; padding:7pt; font-size:8.5pt;
+      white-space:pre-wrap; border-radius:3pt }
+.warn { border-left:3pt solid #b3261e; background:#fdf1f0; padding:7pt 10pt; margin:9pt 0 }
+.ok   { border-left:3pt solid #137a4b; background:#eff8f3; padding:7pt 10pt; margin:9pt 0 }
+.note { border-left:3pt solid #a4571a; background:#fdf6ec; padding:7pt 10pt; margin:9pt 0 }
+svg { max-width:100%; height:auto }
+.pb { page-break-before: always }
+ul,ol { margin:5pt 0 5pt 16pt; padding:0 } li { margin:2pt 0 }
+</style></head><body>
+
+<h1>Multi-Balance Data Acquisition — Deployment Architecture</h1>
+<p class="sub">Radwag balances → MOXA NPort 5150 → pharma LAN → central collector PC → Supabase</p>
+
+<p>Complete configuration and operating procedure for connecting N Radwag balances
+to a central Windows 10 collector via MOXA NPort 5150 serial device servers, with
+onward replication to Supabase.</p>
+
+<h2>1. Target architecture</h2>
+
+<svg viewBox="0 0 760 300" xmlns="http://www.w3.org/2000/svg">
+<style>
+ .b{fill:#fff;stroke:#333;stroke-width:1.2} .l{stroke:#333;stroke-width:1.2;fill:none}
+ .t{font:9.5px -apple-system,Helvetica;fill:#111} .s{font:8px monospace;fill:#555}
+ .g{fill:#eef3fb;stroke:#2d6cdf;stroke-width:1.2}
+ .y{fill:#fdf6ec;stroke:#a4571a;stroke-width:1.2}
+</style>
+<rect class="b" x="8"  y="18"  width="96" height="40" rx="4"/><text class="t" x="18" y="36">Balance 1</text><text class="s" x="18" y="49">Radwag XA 4Y</text>
+<rect class="b" x="8"  y="76"  width="96" height="40" rx="4"/><text class="t" x="18" y="94">Balance 2</text><text class="s" x="18" y="107">Radwag</text>
+<rect class="b" x="8"  y="176" width="96" height="40" rx="4"/><text class="t" x="18" y="194">Balance N</text><text class="s" x="18" y="207">Radwag</text>
+<text class="t" x="45" y="145">⋮</text>
+
+<rect class="g" x="150" y="18"  width="104" height="40" rx="4"/><text class="t" x="159" y="36">NPort 5150 #1</text><text class="s" x="159" y="49">10.x.y.11 : 4001</text>
+<rect class="g" x="150" y="76"  width="104" height="40" rx="4"/><text class="t" x="159" y="94">NPort 5150 #2</text><text class="s" x="159" y="107">10.x.y.12 : 4001</text>
+<rect class="g" x="150" y="176" width="104" height="40" rx="4"/><text class="t" x="159" y="194">NPort 5150 #N</text><text class="s" x="159" y="207">10.x.y.1N : 4001</text>
+
+<line class="l" x1="104" y1="38"  x2="150" y2="38"/>
+<line class="l" x1="104" y1="96"  x2="150" y2="96"/>
+<line class="l" x1="104" y1="196" x2="150" y2="196"/>
+<text class="s" x="106" y="32">RS-232</text><text class="s" x="106" y="90">null-modem</text><text class="s" x="106" y="190">DB9 F–F</text>
+
+<rect class="y" x="300" y="90" width="112" height="66" rx="4"/>
+<text class="t" x="310" y="112">Pharma LAN</text><text class="s" x="310" y="126">wall sockets</text><text class="s" x="310" y="138">switch / VLAN</text>
+<line class="l" x1="254" y1="38"  x2="300" y2="110"/>
+<line class="l" x1="254" y1="96"  x2="300" y2="118"/>
+<line class="l" x1="254" y1="196" x2="300" y2="136"/>
+
+<rect class="b" x="458" y="86" width="126" height="74" rx="4"/>
+<text class="t" x="468" y="107">Collector PC</text>
+<text class="s" x="468" y="121">balance_server.py</text>
+<text class="s" x="468" y="133">SQLite (buffer)</text>
+<text class="s" x="468" y="145">1 TCP client per NPort</text>
+<line class="l" x1="412" y1="123" x2="458" y2="123"/>
+<text class="s" x="414" y="117">TCP 4001</text>
+
+<rect class="b" x="630" y="86" width="118" height="74" rx="4"/>
+<text class="t" x="640" y="107">Supabase</text><text class="s" x="640" y="121">Postgres + REST</text>
+<text class="s" x="640" y="133">HTTPS 443</text><text class="s" x="640" y="145">outbound only</text>
+<line class="l" x1="584" y1="123" x2="630" y2="123"/>
+<text class="s" x="588" y="117">TLS</text>
+<text class="s" x="458" y="182">Records survive a WAN outage in SQLite and sync when the link returns.</text>
+</svg>
+
+<h2>2. IP addressing — must be done before deployment</h2>
+<div class="warn">
+<b>Every NPort ships on 192.168.127.254.</b> Your Mac is currently on the same
+192.168.127.0/24 island, which is why it works on the bench. The moment two units
+are plugged into the pharma LAN with factory settings you get an <b>IP conflict</b>,
+and neither will be reachable.
+</div>
+<p><b>Fix:</b> before each unit leaves the bench, give it a unique address on the
+plant subnet (Network Settings → IP address / Netmask / Gateway → Save/Restart).
+Ask IT for a reserved block, one per instrument:</p>
+<table>
+<tr><th>Instrument</th><th>NPort IP</th><th>Port</th><th>Location</th></tr>
+<tr><td>Balance 01</td><td>10.20.30.11</td><td>4001</td><td>QC Lab A</td></tr>
+<tr><td>Balance 02</td><td>10.20.30.12</td><td>4001</td><td>QC Lab A</td></tr>
+<tr><td>Balance N</td><td>10.20.30.1N</td><td>4001</td><td>…</td></tr>
+<tr><td>Collector PC</td><td>10.20.30.10</td><td>—</td><td>Server room</td></tr>
+</table>
+<p>Use <b>static IPs</b>, or DHCP reservations by MAC. Never plain DHCP — the
+collector addresses NPorts by IP and a lease change silently breaks acquisition.</p>
+
+<h2>3. Bench provisioning procedure (per unit)</h2>
+<ol>
+<li>Connect the new NPort directly to the Mac; set the Mac to 192.168.127.10/24.</li>
+<li>Browse to <code>http://192.168.127.254</code>, password <code>moxa</code>.</li>
+<li><b>Change the admin password.</b> Factory default must not reach the plant LAN.</li>
+<li>Network Settings → set the assigned static IP, netmask, gateway.</li>
+<li>Serial Settings → 4800, 8, None, 1, flow control None, RS-232 (match the balance).</li>
+<li>Operating Settings → TCP Server Mode, Local TCP port 4001, Max connection 1.</li>
+<li>Accessible IP Settings → allow <b>only</b> the collector PC's IP.</li>
+<li>SNMP → set a non-default community string, or disable SNMP.</li>
+<li>Save/Restart, then re-verify the live baud over SNMP or the console.</li>
+<li>Label the unit with its IP and the instrument it serves.</li>
+</ol>
+<div class="note"><b>Verify before shipping to the floor:</b> loopback pins 2–3 on the
+NPort's DB9 and confirm an exact echo. That proves the unit before it is ever
+blamed for a cabling fault in the field.</div>
+
+<h2 class="pb">3b. Windows 10 — network configuration</h2>
+
+<h3>Set the static IP on the collector PC</h3>
+<ol>
+<li><b>Settings → Network &amp; Internet → Ethernet</b> → click the adapter name.</li>
+<li>Under <b>IP settings</b> click <b>Edit</b>.</li>
+<li>Change <b>Automatic (DHCP)</b> to <b>Manual</b>, switch <b>IPv4</b> to On.</li>
+<li>Enter: IP <code>10.20.30.10</code> · Subnet prefix length <code>24</code> ·
+Gateway <code>10.20.30.1</code> · DNS as supplied by IT.</li>
+<li><b>Save</b>.</li>
+</ol>
+<p>Command-line equivalent (run PowerShell or CMD <b>as Administrator</b>):</p>
+<pre>netsh interface ipv4 show interfaces
+netsh interface ipv4 set address name="Ethernet" static 10.20.30.10 255.255.255.0 10.20.30.1
+netsh interface ipv4 set dns    name="Ethernet" static 10.20.30.5
+ipconfig /all</pre>
+
+<h3>Bench-provisioning a new NPort from Windows</h3>
+<p>A factory NPort answers on 192.168.127.254, so the PC needs a temporary address on
+that subnet. Add a <b>second IP</b> rather than disturbing the plant address:</p>
+<pre>netsh interface ipv4 add address name="Ethernet" 192.168.127.10 255.255.255.0</pre>
+<p>Configure the unit, then remove the temporary address:</p>
+<pre>netsh interface ipv4 delete address name="Ethernet" 192.168.127.10</pre>
+
+<h3>Verify connectivity to each NPort</h3>
+<pre>ping 10.20.30.11
+Test-NetConnection 10.20.30.11 -Port 4001        # PowerShell
+</pre>
+<p><code>TcpTestSucceeded : True</code> confirms the serial port is reachable.</p>
+
+<h3>Windows Firewall</h3>
+<p>Outbound rules only — the collector initiates every connection, so no inbound
+ports need opening for acquisition.</p>
+<pre>New-NetFirewallRule -DisplayName "Balance NPort out" -Direction Outbound `
+  -Protocol TCP -RemotePort 4001 -RemoteAddress 10.20.30.0/24 -Action Allow
+New-NetFirewallRule -DisplayName "Supabase HTTPS out" -Direction Outbound `
+  -Protocol TCP -RemotePort 443 -Action Allow</pre>
+<p>If the web UI is bound to <code>127.0.0.1</code> it needs no firewall rule at all.
+Only open inbound TCP 8000 if other machines must reach the dashboard, and restrict
+it by source address.</p>
+
+<h3>Run the collector as a Windows service</h3>
+<p>It must survive reboot and logoff. Using NSSM (<i>nssm.cc</i>):</p>
+<pre>nssm install BalanceCollector "C:\Python312\python.exe" "C:\balance\balance_server.py"
+nssm set BalanceCollector AppDirectory C:\balance
+nssm set BalanceCollector Start SERVICE_AUTO_START
+nssm set BalanceCollector AppStdout C:\balance\logs\out.log
+nssm set BalanceCollector AppStderr C:\balance\logs\err.log
+nssm start BalanceCollector</pre>
+<p>Alternative without extra tools — Task Scheduler: trigger <b>At startup</b>,
+<b>Run whether user is logged on or not</b>, <b>Run with highest privileges</b>.</p>
+
+<h3>Time synchronisation</h3>
+<pre>w32tm /config /manualpeerlist:"ntp.corp.local" /syncfromflags:manual /update
+w32tm /resync
+w32tm /query /status</pre>
+<p>The collector clock is the reference timestamp for every record, so it must be
+disciplined to the plant NTP source.</p>
+
+<h3>Protect the secrets file</h3>
+<pre>icacls C:\balance\.env /inheritance:r
+icacls C:\balance\.env /grant:r "NT SERVICE\BalanceCollector:(R)"
+icacls C:\balance\.env /grant:r "Administrators:(F)"</pre>
+<p>Consider enabling BitLocker on the collector's drive; the SQLite buffer holds
+GxP records before they replicate.</p>
+
+<h2 class="pb">4. Collector PC</h2>
+<p>One process, one thread per NPort, one TCP connection each. NPort
+<code>Max connection = 1</code>, so <b>only the collector may connect</b> — no second
+tool, no engineer's laptop, while it runs.</p>
+<table>
+<tr><th>Requirement</th><th>Specification</th></tr>
+<tr><td>OS</td><td>Windows 10; runs as a service (NSSM or Task Scheduler), auto-start on boot</td></tr>
+<tr><td>Network</td><td>Static IP, same VLAN as the NPorts, or a routed path</td></tr>
+<tr><td>Firewall</td><td>Outbound TCP 4001 to each NPort; outbound TCP 443 to Supabase</td></tr>
+<tr><td>Storage</td><td>SQLite local buffer; records survive WAN loss and sync later</td></tr>
+<tr><td>Backup</td><td>Nightly copy of the SQLite file to plant backup</td></tr>
+<tr><td>Time</td><td>NTP-synced. Balance RTCs drift; the collector clock is the reference</td></tr>
+</table>
+
+<h3>Data flow per weighing</h3>
+<svg viewBox="0 0 740 176" xmlns="http://www.w3.org/2000/svg">
+<style>.b2{fill:#fff;stroke:#333;stroke-width:1.1}.a{stroke:#333;stroke-width:1.1;fill:none;marker-end:url(#ar)}
+.t2{font:9px -apple-system,Helvetica;fill:#111}.s2{font:7.5px monospace;fill:#555}</style>
+<defs><marker id="ar" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto">
+<path d="M0,0 L6,3 L0,6 z" fill="#333"/></marker></defs>
+<rect class="b2" x="6"   y="14" width="88" height="30" rx="3"/><text class="t2" x="14" y="33">Operator</text>
+<rect class="b2" x="128" y="14" width="88" height="30" rx="3"/><text class="t2" x="140" y="33">Balance</text>
+<rect class="b2" x="250" y="14" width="88" height="30" rx="3"/><text class="t2" x="262" y="33">NPort</text>
+<rect class="b2" x="372" y="14" width="104" height="30" rx="3"/><text class="t2" x="380" y="33">Collector</text>
+<rect class="b2" x="510" y="14" width="96" height="30" rx="3"/><text class="t2" x="522" y="33">Supabase</text>
+<line class="a" x1="94" y1="29" x2="128" y2="29"/><line class="a" x1="216" y1="29" x2="250" y2="29"/>
+<line class="a" x1="338" y1="29" x2="372" y2="29"/><line class="a" x1="476" y1="29" x2="510" y2="29"/>
+<text class="s2" x="10"  y="66">1. HEADER  → opens session (Date, Time, S/N, Operator, INST-ID, Reg No)</text>
+<text class="s2" x="10"  y="82">2. PRINT   → weight burst, appended to that session</text>
+<text class="s2" x="10"  y="98">3. PRINT   → weight burst, appended</text>
+<text class="s2" x="10"  y="114">4. FOOTER  → closes session; ONE record committed to SQLite</text>
+<text class="s2" x="10"  y="130">5. Sync    → record POSTed to Supabase over HTTPS, marked synced</text>
+<text class="s2" x="10"  y="150">Adjustment (internal CAL) reports are standalone and commit immediately.</text>
+<text class="s2" x="10"  y="164">A weight or footer with no open session is discarded as a false input.</text>
+</svg>
+
+<h2>5. Supabase</h2>
+<pre>create table balance_records (
+  id            bigserial primary key,
+  moxa_name     text not null,
+  moxa_host     inet not null,
+  kind          text not null check (kind in ('weighing','adjustment')),
+  label         text not null,
+  inst_id       text, reg_no text, balance_sn text, operator text,
+  started_at    timestamptz, finished_at timestamptz,
+  raw_text      text not null,          -- verbatim transcript, the legal record
+  blocks        jsonb  not null,        -- [{seq,kind,received,body}, ...]
+  collector_id  text not null,
+  created_at    timestamptz default now(),
+  unique (moxa_name, started_at, label)  -- idempotent re-sync
+);
+alter table balance_records enable row level security;</pre>
+<ul>
+<li>Push with the <b>service role key</b> from the collector only. It must never
+reach a browser or an operator workstation.</li>
+<li>The unique constraint makes retries idempotent — a failed sync can be replayed
+without creating duplicates.</li>
+<li>Keep <code>raw_text</code> verbatim. Parsed fields are a convenience; the
+transcript is the record that stands up to audit.</li>
+<li>Records are <b>insert-only</b>. No updates, no deletes — revoke those in RLS.</li>
+</ul>
+
+<h2>6. Security controls</h2>
+<table>
+<tr><th>Layer</th><th>Control</th></tr>
+<tr><td>NPort</td><td>Change default password; Accessible IP = collector only; non-default SNMP community or SNMP disabled</td></tr>
+<tr><td>Network</td><td>Instruments on a dedicated VLAN; no internet route inbound; only the collector may reach port 4001</td></tr>
+<tr><td>Collector</td><td>Runs as a service account; web UI bound to localhost or behind TLS; PBKDF2 login; CSRF; rate limiting</td></tr>
+<tr><td>Secrets</td><td>Supabase keys encrypted at rest, decrypted only in memory; master key in <code>.env</code>, file mode 600</td></tr>
+<tr><td>Transport</td><td>Supabase over TLS 1.2+. <b>RS-232 and TCP 4001 are cleartext</b> — VLAN isolation is the mitigation</td></tr>
+<tr><td>Audit</td><td>Insert-only table; collector retains local SQLite as second copy</td></tr>
+</table>
+
+<h2>7. Regulated-environment notes (GxP)</h2>
+<ul>
+<li><b>Clock discipline.</b> Balance RTC drift was measured on the bench. Record both
+the instrument's printed timestamp and the collector's NTP-synced receipt time.</li>
+<li><b>Nothing invented.</b> The collector stores what the balance transmitted,
+verbatim. It never fabricates or back-fills metadata.</li>
+<li><b>Qualification.</b> Expect IQ/OQ/PQ. The bench loopback test and a documented
+end-to-end sample per instrument form the evidence base.</li>
+<li><b>Change control.</b> NPort serial settings and balance printout templates are
+configuration items — record them per instrument and re-verify after any change.</li>
+</ul>
+
+<h2>8. Scaling and cost</h2>
+<table>
+<tr><th>Item</th><th>Qty</th><th>Note</th></tr>
+<tr><td>MOXA NPort 5150</td><td>1 per balance</td><td>1 serial port each</td></tr>
+<tr><td>DB9 null-modem cable, F–F</td><td>1 per balance</td><td>Must say "null modem" or "crossover", never "direct"</td></tr>
+<tr><td>LAN drop</td><td>1 per NPort</td><td>Existing wall sockets are fine</td></tr>
+<tr><td>Collector PC</td><td>1 total</td><td>Handles dozens of NPorts; each is idle most of the time</td></tr>
+</table>
+<p>Consider an NPort 5610 (8/16 ports) where several balances sit in one room —
+fewer LAN drops and fewer IPs, at the cost of one shared failure point.</p>
+
+<h2>9. Commissioning checklist</h2>
+<table>
+<tr><th>#</th><th>Check</th><th>Pass criterion</th></tr>
+<tr><td>1</td><td>NPort IP reassigned, default password changed</td><td>Reachable on plant subnet, factory password rejected</td></tr>
+<tr><td>2</td><td><code>ping</code> from collector</td><td>0% loss</td></tr>
+<tr><td>3</td><td><code>nc -vz &lt;ip&gt; 4001</code></td><td>Connection succeeded</td></tr>
+<tr><td>4</td><td>DB9 loopback at the NPort</td><td>Exact echo of the test string</td></tr>
+<tr><td>5</td><td>Balance connected, header printed</td><td><code>RxTotalCnt</code> &gt; 0 on Monitor → Async</td></tr>
+<tr><td>6</td><td>Full session: header → weight → footer</td><td>One record with all fields</td></tr>
+<tr><td>7</td><td>Adjustment report</td><td>Standalone record, correct S/N</td></tr>
+<tr><td>8</td><td>Supabase row present</td><td>Matches SQLite verbatim</td></tr>
+<tr><td>9</td><td>Pull the LAN cable for 5 min</td><td>Records buffer, then sync on reconnect</td></tr>
+<tr><td>10</td><td>Reboot collector</td><td>Service auto-starts, reconnects to all NPorts</td></tr>
+</table>
+
+<h2>10. Known constraints carried from the bench</h2>
+<table>
+<tr><th>Constraint</th><th>Impact</th></tr>
+<tr><td>NPort <code>Max connection = 1</code></td><td>Only the collector may connect. No parallel debugging while live.</td></tr>
+<tr><td>One NPort web-console session</td><td>A browser session evicts scripted logins.</td></tr>
+<tr><td>Straight-through cables do not work</td><td>Both devices are DTE. Null-modem only.</td></tr>
+<tr><td>Both Printer and Computer on COM1 duplicates output</td><td>Assign only one peripheral per port.</td></tr>
+<tr><td>Balance <code>GET_AMBIENT</code> timestamp is frozen</td><td>Not a clock. Use collector time.</td></tr>
+<tr><td>Printout templates are touchscreen-only (<code>WP</code> is read-only)</td><td>Template changes cannot be automated.</td></tr>
+</table>
+
+</body></html>
