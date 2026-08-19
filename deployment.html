@@ -60,7 +60,7 @@ onward replication to Supabase.</p>
 <rect class="b" x="458" y="86" width="126" height="74" rx="4"/>
 <text class="t" x="468" y="107">Collector PC</text>
 <text class="s" x="468" y="121">balance_server.py</text>
-<text class="s" x="468" y="133">SQLite (buffer)</text>
+<text class="s" x="468" y="133">FastAPI · no local DB</text>
 <text class="s" x="468" y="145">1 TCP client per NPort</text>
 <line class="l" x1="412" y1="123" x2="458" y2="123"/>
 <text class="s" x="414" y="117">TCP 4001</text>
@@ -70,7 +70,7 @@ onward replication to Supabase.</p>
 <text class="s" x="640" y="133">HTTPS 443</text><text class="s" x="640" y="145">outbound only</text>
 <line class="l" x1="584" y1="123" x2="630" y2="123"/>
 <text class="s" x="588" y="117">TLS</text>
-<text class="s" x="458" y="182">Records survive a WAN outage in SQLite and sync when the link returns.</text>
+<text class="s" x="458" y="182">Supabase config is mandatory; each completed session is written straight to Supabase.</text>
 </svg>
 
 <h2>2. IP addressing — must be done before deployment</h2>
@@ -173,8 +173,8 @@ disciplined to the plant NTP source.</p>
 <pre>icacls C:\balance\.env /inheritance:r
 icacls C:\balance\.env /grant:r "NT SERVICE\BalanceCollector:(R)"
 icacls C:\balance\.env /grant:r "Administrators:(F)"</pre>
-<p>Consider enabling BitLocker on the collector's drive; the SQLite buffer holds
-GxP records before they replicate.</p>
+<p>Consider enabling BitLocker on the collector's drive; the <code>.cred</code> file
+holds the collector's encrypted Supabase credentials.</p>
 
 <h2 class="pb">4. Collector PC</h2>
 <p>One process, one thread per NPort, one TCP connection each. NPort
@@ -185,8 +185,8 @@ tool, no engineer's laptop, while it runs.</p>
 <tr><td>OS</td><td>Windows 10; runs as a service (NSSM or Task Scheduler), auto-start on boot</td></tr>
 <tr><td>Network</td><td>Static IP, same VLAN as the NPorts, or a routed path</td></tr>
 <tr><td>Firewall</td><td>Outbound TCP 4001 to each NPort; outbound TCP 443 to Supabase</td></tr>
-<tr><td>Storage</td><td>SQLite local buffer; records survive WAN loss and sync later</td></tr>
-<tr><td>Backup</td><td>Nightly copy of the SQLite file to plant backup</td></tr>
+<tr><td>Storage</td><td>No local database — every session is written directly to Supabase, the system of record</td></tr>
+<tr><td>Config</td><td>Supabase connection is mandatory; the collector captures nothing until it is set</td></tr>
 <tr><td>Time</td><td>NTP-synced. Balance RTCs drift; the collector clock is the reference</td></tr>
 </table>
 
@@ -206,32 +206,58 @@ tool, no engineer's laptop, while it runs.</p>
 <text class="s2" x="10"  y="66">1. HEADER  → opens session (Date, Time, S/N, Operator, INST-ID, Reg No)</text>
 <text class="s2" x="10"  y="82">2. PRINT   → weight burst, appended to that session</text>
 <text class="s2" x="10"  y="98">3. PRINT   → weight burst, appended</text>
-<text class="s2" x="10"  y="114">4. FOOTER  → closes session; ONE record committed to SQLite</text>
-<text class="s2" x="10"  y="130">5. Sync    → record POSTed to Supabase over HTTPS, marked synced</text>
+<text class="s2" x="10"  y="114">4. FOOTER  → closes session; ONE record written directly to Supabase over HTTPS</text>
+<text class="s2" x="10"  y="130">5. Store   → no local database; Supabase is the single system of record</text>
 <text class="s2" x="10"  y="150">Adjustment (internal CAL) reports are standalone and commit immediately.</text>
 <text class="s2" x="10"  y="164">A weight or footer with no open session is discarded as a false input.</text>
 </svg>
 
 <h2>5. Supabase</h2>
-<pre>create table balance_records (
-  id            bigserial primary key,
-  moxa_name     text not null,
-  moxa_host     inet not null,
-  kind          text not null check (kind in ('weighing','adjustment')),
-  label         text not null,
-  inst_id       text, reg_no text, balance_sn text, operator text,
-  started_at    timestamptz, finished_at timestamptz,
-  raw_text      text not null,          -- verbatim transcript, the legal record
-  blocks        jsonb  not null,        -- [{seq,kind,received,body}, ...]
-  collector_id  text not null,
-  created_at    timestamptz default now(),
-  unique (moxa_name, started_at, label)  -- idempotent re-sync
+<div class="warn"><b>Supabase configuration is mandatory.</b> The collector keeps no
+local database; until Supabase is configured it captures nothing. In
+<b>self-hosted</b> mode it creates the two tables automatically on first connect;
+in <b>cloud</b> mode (<code>*.supabase.co</code>) it reaches Supabase over REST,
+which cannot issue DDL, so apply the migration
+(<code>*_moxa_and_balance_integration.sql</code>) to the project first.</div>
+<pre>-- "moxaServers": one row per MOXA NPort gateway
+create table if not exists public."moxaServers" (
+  id                uuid primary key default gen_random_uuid(),
+  host              text not null unique,
+  port              integer not null default 4001,
+  name              text,
+  enabled           boolean not null default true,
+  status            text default 'idle',
+  last_seen         timestamptz,
+  moxa_password_enc text,            -- device password, ENCRYPTED (never plaintext)
+  collector_id      text,
+  created_at        timestamptz default now(),
+  updated_at        timestamptz default now()
 );
-alter table balance_records enable row level security;</pre>
+
+-- balance_integration_data: one row per completed session, FK -> "moxaServers"
+create table if not exists public.balance_integration_data (
+  id           uuid primary key default gen_random_uuid(),
+  moxa_id      uuid not null references public."moxaServers"(id),
+  moxa_name    text not null, moxa_host text not null,
+  kind         text not null check (kind in ('weighing','adjustment')),
+  label        text not null,
+  inst_id text, reg_no text, balance_sn text, operator text,
+  started_at   timestamptz, finished_at timestamptz,
+  raw_text     text not null,         -- verbatim transcript, the legal record
+  blocks       jsonb not null default '[]'::jsonb,  -- [{seq,kind,received,body}]
+  bytes        integer not null default 0,
+  collector_id text, created_at timestamptz default now(),
+  unique (moxa_id, started_at, label)  -- idempotent re-sync
+);
+alter table public."moxaServers" enable row level security;
+alter table public.balance_integration_data enable row level security;</pre>
 <ul>
-<li>Push with the <b>service role key</b> from the collector only. It must never
-reach a browser or an operator workstation.</li>
-<li>The unique constraint makes retries idempotent — a failed sync can be replayed
+<li>The collector writes with the <b>service role key</b> (cloud) or the admin
+Postgres role (self-hosted) only. It must never reach a browser or operator
+workstation.</li>
+<li>The LIMS reads these tables <b>read-only and column-scoped</b>, so MOXA device
+passwords never leave the database.</li>
+<li>The unique constraint makes retries idempotent — a failed write can be replayed
 without creating duplicates.</li>
 <li>Keep <code>raw_text</code> verbatim. Parsed fields are a convenience; the
 transcript is the record that stands up to audit.</li>
@@ -244,9 +270,9 @@ transcript is the record that stands up to audit.</li>
 <tr><td>NPort</td><td>Change default password; Accessible IP = collector only; non-default SNMP community or SNMP disabled</td></tr>
 <tr><td>Network</td><td>Instruments on a dedicated VLAN; no internet route inbound; only the collector may reach port 4001</td></tr>
 <tr><td>Collector</td><td>Runs as a service account; web UI bound to localhost or behind TLS; PBKDF2 login; CSRF; rate limiting</td></tr>
-<tr><td>Secrets</td><td>Supabase keys encrypted at rest, decrypted only in memory; master key in <code>.env</code>, file mode 600</td></tr>
+<tr><td>Secrets</td><td>Supabase keys &amp; MOXA device passwords encrypted at rest (Windows DPAPI, else keyed from the session secret); config in <code>.cred</code>, git-ignored</td></tr>
 <tr><td>Transport</td><td>Supabase over TLS 1.2+. <b>RS-232 and TCP 4001 are cleartext</b> — VLAN isolation is the mitigation</td></tr>
-<tr><td>Audit</td><td>Insert-only table; collector retains local SQLite as second copy</td></tr>
+<tr><td>Audit</td><td>Insert-only table; verbatim <code>raw_text</code> retained as the legal record</td></tr>
 </table>
 
 <h2>7. Regulated-environment notes (GxP)</h2>
@@ -282,8 +308,8 @@ fewer LAN drops and fewer IPs, at the cost of one shared failure point.</p>
 <tr><td>5</td><td>Balance connected, header printed</td><td><code>RxTotalCnt</code> &gt; 0 on Monitor → Async</td></tr>
 <tr><td>6</td><td>Full session: header → weight → footer</td><td>One record with all fields</td></tr>
 <tr><td>7</td><td>Adjustment report</td><td>Standalone record, correct S/N</td></tr>
-<tr><td>8</td><td>Supabase row present</td><td>Matches SQLite verbatim</td></tr>
-<tr><td>9</td><td>Pull the LAN cable for 5 min</td><td>Records buffer, then sync on reconnect</td></tr>
+<tr><td>8</td><td>Supabase row present</td><td>Row in balance_integration_data matches the printout verbatim</td></tr>
+<tr><td>9</td><td>Supabase configured before go-live</td><td>Collector refuses to capture until configured (config is mandatory)</td></tr>
 <tr><td>10</td><td>Reboot collector</td><td>Service auto-starts, reconnects to all NPorts</td></tr>
 </table>
 

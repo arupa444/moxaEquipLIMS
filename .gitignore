@@ -8,7 +8,10 @@ records/
 records_raw/
 sessions/
 capture*.log
-
+.cred
+.cred.*
+.authstate.json
+.authstate.*.json
 .DS_Store
 .idea/
 .env.*
