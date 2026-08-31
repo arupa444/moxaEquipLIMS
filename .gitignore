@@ -12,6 +12,7 @@ capture*.log
 .cred.*
 .authstate.json
 .authstate.*.json
+outbox/
 .DS_Store
 .idea/
 .env.*
