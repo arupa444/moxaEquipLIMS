@@ -1,0 +1,54 @@
+robocopy "C:\Users\HP\Documents\GitHub\moxaEquipLIMS" "C:\LIMSBalanceHub" /E /XD .git .venv outbox __pycache__ sessions .idea /XF hub.out.log hub.err.log balance.db
+
+
+
+LIMS Balance & pH Meter Integration Hub — deploy to a collector PC, end to end
+Machine: Windows 10/11 x64 on the instrument LAN (the MOXA NPort must be reachable).
+
+Phase 0 — Copy the hub to the C: drive
+Run the robocopy line above from a command prompt.
+   Source: C:\Users\HP\Documents\GitHub\moxaEquipLIMS
+   Dest  : C:\LIMSBalanceHub        (change the destination if you prefer)
+
+Phase 1 — Python + dependencies (once)
+   cd C:\LIMSBalanceHub
+   py -3.12 -m venv .venv                 (Python 3.10 or newer is required)
+   .venv\Scripts\python -m pip install --upgrade pip
+   .venv\Scripts\python -m pip install -r requirements.txt
+
+Phase 2 — Start the hub in the background
+   Double-click  C:\LIMSBalanceHub\start-hub.bat
+   -> runs hidden, serves  http://127.0.0.1:8000  (stop with stop-hub.bat)
+   -> logs: C:\LIMSBalanceHub\hub.out.log  and  hub.err.log
+
+Phase 3 — Configure Supabase (mandatory) — open http://127.0.0.1:8000  -> Settings
+   Deployment          : Self-hosted Supabase (via API URL)
+   SUPABASE_URL        : http://<supabase-host>:8000     (e.g. http://10.1.11.98:8000)
+   Service role key    : <self-hosted service-role key>
+   Publishable/anon key: <self-hosted anon key>
+   Session secret      : (min 32 chars)
+   Save & connect.
+   NOTE: apply the DB migrations first so the tables exist
+         (*_moxa_and_balance_integration.sql, *_ph_meter_integration.sql, ...).
+
+Phase 4 — Add the MOXA gateways on the dashboard
+   For each NPort: host = device IP, port = 4001 (or the device's data port),
+   instrument type = balance  (Balance page) or  ph_meter  (PH Meter page).
+   The Balance page shows only balance gateways; the PH page shows only pH gateways.
+
+Phase 5 — Firewall (only if the browser UI is opened from another PC)
+   netsh advfirewall firewall add rule name="LIMS Balance Hub 8000" dir=in action=allow protocol=TCP localport=8000
+
+Phase 6 — Verify the chain
+   - On the balance: print Header -> Weight(s) -> Footer; click Refresh on the Balance
+     Integration page in the LIMS -> the session appears. Print an Adjustment too.
+   - On the pH meter: print Calibration + Readings + Verification (merge to one set),
+     then a Sample report -> click Refresh on the PH Meter Integration page.
+   - In a Raw Data worksheet: select the Equipment, use Get balance data / Get pH data,
+     Attach, Save -> the record shows "Linked".
+
+The golden rules
+   - One hub instance only. If port 8000 is busy, run stop-hub.bat (or reboot).
+   - Never copy the .venv from another machine — always rebuild it (Phase 1).
+   - Secrets are stored DPAPI-encrypted in .cred on the hub; never commit or copy .cred.
+   - The dedicated instrument Ethernet link carries MOXA data only — not internet.
