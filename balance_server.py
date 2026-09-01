@@ -859,12 +859,14 @@ def ensure_password() -> str | None:
         return None
     if st.get("pw_salt"):
         return None
-    pw = secrets.token_urlsafe(12)
+    # Default login password when none is configured. Override any time by setting
+    # BALANCE_PASSWORD in .cred (re-applied on every startup).
+    pw = "Megsan@123"
     salt = secrets.token_bytes(16)
     st["pw_salt"] = salt.hex()
     st["pw_hash"] = hash_pw(pw, salt).hex()
     _save_authstate(st)
-    return pw
+    return None
 
 
 def check_pw(pw: str) -> bool:
