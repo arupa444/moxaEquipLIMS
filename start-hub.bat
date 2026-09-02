@@ -60,11 +60,10 @@ if errorlevel 1 (
   goto :end
 )
 
-REM --- Install / update packages on first run or when requirements change. -
-set "NEED=1"
-powershell -NoProfile -Command "if(!(Test-Path '%STAMP%')){'1'} elseif((Get-Item '%~dp0requirements.txt').LastWriteTime -gt (Get-Item '%STAMP%').LastWriteTime){'1'} else {'0'}" > "%TMPF%" 2>nul
-set /p NEED=<"%TMPF%"
-del "%TMPF%" >nul 2>&1
+REM --- Install packages only on first run (stamp missing). To force a
+REM     reinstall later, delete .venv\.deps-installed and run this again.
+set "NEED=0"
+if not exist "%STAMP%" set "NEED=1"
 if "%NEED%"=="1" (
   echo   Installing/updating packages ^(first run can take a minute^)...
   "%VENVPY%" -m pip install --upgrade pip

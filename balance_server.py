@@ -1213,7 +1213,8 @@ class Station(threading.Thread):
                     sock.settimeout(0.2)
                     self._status("connected")
                 except ConnectionRefusedError:
-                    self._status("busy: port 4001 in use by another client")
+                    self._status(f"refused: port {self.port} in use by another client, "
+                                 f"or that NPort serial port is not set to TCP Server mode")
                     time.sleep(5)
                     continue
                 except OSError as exc:
