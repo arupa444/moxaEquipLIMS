@@ -927,14 +927,72 @@ def rate_limited(ip: str) -> bool:
 # The session-detection state machine is preserved verbatim from the original
 # collector; only the storage sink changed (Supabase, not SQLite/.txt).
 
+def _ber_len(n: int) -> bytes:
+    if n < 0x80:
+        return bytes([n])
+    b = bytearray()
+    while n:
+        b.insert(0, n & 0xFF)
+        n >>= 8
+    return bytes([0x80 | len(b)]) + bytes(b)
+
+
+def _tlv(tag: int, val: bytes) -> bytes:
+    return bytes([tag]) + _ber_len(len(val)) + val
+
+
+def snmp_server_name(host: str, community: str = "public", timeout: float = 2.0) -> str | None:
+    """Fetch the MOXA's configured Server name via SNMP v1 (sysName,
+    OID 1.3.6.1.2.1.1.5.0) using a raw UDP request -- no external `snmpget`
+    binary needed, so it works on Windows. Returns None if SNMP is off,
+    unreachable, or the community differs from the default."""
+    oid = bytes([0x2b, 6, 1, 2, 1, 1, 5, 0])          # 1.3.6.1.2.1.1.5.0
+    oid_tlv = _tlv(0x06, oid)
+    varbind = _tlv(0x30, oid_tlv + _tlv(0x05, b""))    # OID + NULL
+    pdu = _tlv(0xA0,                                    # GET-REQUEST
+               _tlv(0x02, os.urandom(4))               # request-id
+               + _tlv(0x02, b"\x00")                   # error-status
+               + _tlv(0x02, b"\x00")                   # error-index
+               + _tlv(0x30, varbind))                  # varbind list
+    msg = _tlv(0x30, _tlv(0x02, b"\x00")               # version = 0 (v1)
+               + _tlv(0x04, community.encode())        # community
+               + pdu)
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(timeout)
+    try:
+        s.sendto(msg, (host, 161))
+        data, _ = s.recvfrom(2048)
+    except Exception:
+        return None
+    finally:
+        s.close()
+    # The response echoes the request OID, then carries the value in place of NULL.
+    i = data.find(oid_tlv)
+    if i < 0:
+        return None
+    j = i + len(oid_tlv)
+    if j + 1 >= len(data):
+        return None
+    tag = data[j]; j += 1
+    ln = data[j]; j += 1
+    if ln & 0x80:                                       # long-form length
+        nb = ln & 0x7F
+        ln = int.from_bytes(data[j:j + nb], "big"); j += nb
+    val = data[j:j + ln]
+    if tag != 0x04:                                     # expect OCTET STRING
+        return None
+    name = val.decode("latin-1", "replace").strip().strip('"')
+    return name or None
+
+
 def moxa_name(host: str) -> str:
     try:
-        r = subprocess.run(["snmpget", "-v1", "-c", "public", "-t", "2", "-r", "1",
-                            "-Oqv", host, "1.3.6.1.2.1.1.5.0"],
-                           capture_output=True, text=True, timeout=6)
-        return r.stdout.strip().strip('"') or f"NPort-{host.replace('.', '-')}"
+        name = snmp_server_name(host)
+        if name:
+            return name
     except Exception:
-        return f"NPort-{host.replace('.', '-')}"
+        pass
+    return f"NPort-{host.replace('.', '-')}"
 
 
 def kind_of(text: str) -> str:
