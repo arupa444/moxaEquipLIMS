@@ -1301,6 +1301,32 @@ def outbox_submit(ev: dict) -> bool:
     return flush_outbox() == 0
 
 
+def _enable_keepalive(sock: socket.socket) -> None:
+    """Turn on TCP keepalive so a MOXA that loses power or its Ethernet link is
+    detected within ~20-30s. A passive reader never notices a half-open TCP
+    connection otherwise (recv() just keeps timing out with no error). Keepalive
+    probes are EMPTY TCP segments -- they are never forwarded to the instrument's
+    serial line, so this cannot disturb the balance."""
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except OSError:
+        return
+    if hasattr(socket, "SIO_KEEPALIVE_VALS"):          # Windows
+        try:
+            # (on/off, idle before first probe = 5s, interval between probes = 2s)
+            sock.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 5000, 2000))
+        except OSError:
+            pass
+    else:                                              # Linux / macOS (best effort)
+        for name, val in (("TCP_KEEPIDLE", 5), ("TCP_KEEPINTVL", 2), ("TCP_KEEPCNT", 4)):
+            opt = getattr(socket, name, None)
+            if opt is not None:
+                try:
+                    sock.setsockopt(socket.IPPROTO_TCP, opt, val)
+                except OSError:
+                    pass
+
+
 class Station(threading.Thread):
     """One MOXA: own socket, own buffer, own session queue -> Supabase."""
 
@@ -1338,6 +1364,7 @@ class Station(threading.Thread):
             if sock is None:
                 try:
                     sock = socket.create_connection((self.host, self.port), timeout=5)
+                    _enable_keepalive(sock)
                     sock.settimeout(0.2)
                     self._status("connected")
                     next_hb = time.monotonic() + HB
