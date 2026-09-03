@@ -638,6 +638,19 @@ def db_set_status(mid: str, status: str) -> None:
            'updated_at=now() WHERE id=%s', (status, now_iso(), mid))
 
 
+def db_touch(mid: str) -> None:
+    """Heartbeat: refresh last_seen ONLY (leave the status text untouched). Lets the
+    Hub/LIMS tell a live collector from a dead one even when a station is connected
+    but idle -- a stale last_seen then means 'not connected to the server'."""
+    if _via_rest():
+        _rest("PATCH", "moxaServers", {"id": f"eq.{mid}"},
+              body={"last_seen": now_iso(), "updated_at": now_iso()},
+              prefer="return=minimal")
+    else:
+        ex('UPDATE public."moxaServers" SET last_seen=%s, updated_at=now() '
+           'WHERE id=%s', (now_iso(), mid))
+
+
 def db_insert_session(row: dict) -> None:
     if _via_rest():
         _rest("POST", "balance_integration_data",
@@ -1200,10 +1213,18 @@ class Station(threading.Thread):
         except Exception:
             pass
 
+    def _touch(self) -> None:
+        try:
+            db_touch(self.mid)
+        except Exception:
+            pass
+
     def run(self) -> None:
         sock = None
         buf = bytearray()
         last = 0.0
+        next_hb = 0.0                       # next heartbeat (monotonic seconds)
+        HB = 10.0                           # heartbeat every 10s while connected
         blocks: list[tuple[str, str, str]] = []
         meta: dict[str, str] = {}
         while not self.stop.is_set():
@@ -1212,15 +1233,25 @@ class Station(threading.Thread):
                     sock = socket.create_connection((self.host, self.port), timeout=5)
                     sock.settimeout(0.2)
                     self._status("connected")
+                    next_hb = time.monotonic() + HB
                 except ConnectionRefusedError:
                     self._status(f"refused: port {self.port} in use by another client, "
                                  f"or that NPort serial port is not set to TCP Server mode")
                     time.sleep(5)
                     continue
                 except OSError as exc:
-                    self._status(f"offline: {exc.strerror or exc}")
+                    # Host unreachable / timeout / no route -> the collector cannot
+                    # reach the MOXA (its Ethernet cable is unplugged, or the network
+                    # is down). Report a single, unambiguous state the UI maps to
+                    # "Not Connected to the Server. Please plug in the Ethernet cable."
+                    self._status("disconnected")
                     time.sleep(5)
                     continue
+            # Heartbeat: refresh last_seen while connected (even when idle) so the
+            # Hub/LIMS can tell a live collector from a dead one.
+            if sock is not None and time.monotonic() >= next_hb:
+                self._touch()
+                next_hb = time.monotonic() + HB
             try:
                 chunk = sock.recv(8192)
                 if not chunk:
@@ -1546,22 +1577,52 @@ $('#pvPrint')?.addEventListener('click',()=>{{
 </script>"""
 
 
+# Grace period (seconds) after which a gateway with no fresh heartbeat is treated
+# as not connected to the collector. The collector heartbeats every 10s.
+STATUS_STALE_SECONDS = 40
+GATEWAY_DISCONNECTED_MSG = "Not Connected to the Server. Please plug in the Ethernet cable."
+
+
+def gateway_view(status: str | None, last_seen) -> tuple[str, str, str]:
+    """Map a stored (status, last_seen) to an accurate (label, detail, css_color).
+
+    A collector heartbeats last_seen every ~10s while its link to the MOXA is up,
+    so a stale last_seen means the collector is down or its MOXA Ethernet link is
+    gone -> always reported as Disconnected, never a stale 'Connected'.
+    """
+    low = (status or "").strip().lower()
+    stale = True
+    if last_seen:
+        try:
+            dt = datetime.fromisoformat(str(last_seen).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            stale = (datetime.now(timezone.utc) - dt).total_seconds() > STATUS_STALE_SECONDS
+        except Exception:
+            stale = True
+    if stale or low.startswith(("disconnected", "offline", "reconnect", "removed", "error")):
+        return "Disconnected", GATEWAY_DISCONNECTED_MSG, "var(--bad)"
+    if low.startswith(("refused", "busy")):
+        return "Not ready", (status or "").strip(), "var(--warn)"
+    if low.startswith(("connected", "saved", "queued", "idle")):
+        return "Connected", (status or "").strip(), "var(--ok)"
+    return (status or "unknown").strip(), (status or "").strip(), "var(--warn)"
+
+
 def moxa_card(csrf: str, moxas: list, only_type: str, heading: str,
               default_type: str) -> str:
     """Gateway table + add-form for one instrument type. Used by both tabs."""
     shown = [m for m in moxas if (m.get("instrument_type") or "balance") == only_type]
-    h = [f"<div class=card><h1>{esc(heading)}</h1><table><tr><th>Name<th>Host"
+    h = [f"<div class=card><h1>{esc(heading)}</h1><table><tr><th>IP<th>Name of the Device"
          "<th>Status<th>Last seen<th></tr>"]
     for m in shown:
-        st = esc(m["status"])
-        col = ("var(--ok)" if st.startswith(("connected", "saved"))
-               else "var(--warn)" if st.startswith(("busy", "idle", "reconnect"))
-               else "var(--bad)" if st.startswith(("offline", "removed", "error")) else "var(--warn)")
+        label, detail, col = gateway_view(m.get("status"), m.get("last_seen"))
         last = esc(str(m["last_seen"])[:19].replace("T", " ") if m["last_seen"] else "-")
         h.append(
-            f"<tr><td>{esc(m['name'])}"
-            f"<td class=mono>{esc(m['host'])}:{m['port']}"
-            f"<td><span class=dot style=background:{col}></span>{st}"
+            f"<tr><td class=mono>{esc(m['host'])}:{m['port']}"
+            f"<td>{esc(m['name'])}"
+            f"<td><span class=dot style=background:{col}></span><b>{esc(label)}</b>"
+            f"<div class=mut style=font-size:11px>{esc(detail)}</div>"
             f"<td class=mut>{last}"
             f"<td><form class=inline method=post action=/moxa/del>"
             f"<input type=hidden name=csrf value='{esc(csrf)}'>"
@@ -1574,12 +1635,12 @@ def moxa_card(csrf: str, moxas: list, only_type: str, heading: str,
     h.append("</table><form class='inline' method=post action=/moxa/add "
              "style=margin-top:14px>"
              f"<input type=hidden name=csrf value='{esc(csrf)}'>"
-             "<input name=host placeholder='10.20.30.11' required>"
+             "<input name=host placeholder='IP (e.g. 192.168.127.150)' required>"
              "<input name=port value=4001 size=6>"
              "<select name=instrument_type title='Instrument type'>"
              f"<option value=balance {bal_sel}>Balance</option>"
              f"<option value=ph_meter {ph_sel}>pH Meter</option></select>"
-             "<input name=name placeholder='equipment name (blank = ask via SNMP)'>"
+             "<input name=name placeholder='Name of the Device (server name from the MOXA panel)'>"
              "<input name=moxa_password type=password placeholder='device password (stored encrypted)' autocomplete=off>"
              "<button>Add equipment</button></form></div>")
     return "".join(h)
