@@ -1,4 +1,4 @@
-robocopy "C:\Users\HP\Documents\GitHub\moxaEquipLIMS" "C:\LIMSBalanceHub" /E /XD .git .venv outbox __pycache__ sessions .idea /XF hub.out.log hub.err.log balance.db
+robocopy "C:\Users\HP\Documents\GitHub\moxaEquipLIMS" "C:\LIMSBalanceHub" /E /XD .git .venv outbox __pycache__ sessions data .idea /XF hub.out.log hub.err.log balance.db
 
 
 

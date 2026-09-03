@@ -84,6 +84,48 @@ CRED_PATH = os.environ.get("CRED_FILE", ".cred")
 ENV_PATH = os.environ.get("ENV_FILE", ".env")
 AUTH_STATE = os.environ.get("AUTH_STATE_FILE", ".authstate.json")
 
+# ---- Admin token (replaces the login password; mirrors the Printer hub) ------
+# A per-install secret generated on first run and stored in data/admin_token.txt.
+# The operator pastes it to sign in -- no password to set or leak.
+DATA_DIR = os.environ.get("HUB_DATA_DIR") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "data")
+try:
+    os.makedirs(DATA_DIR, exist_ok=True)
+except Exception:
+    pass
+ADMIN_TOKEN_FILE = os.path.join(DATA_DIR, "admin_token.txt")
+
+
+def _load_or_create_secret(path: str, env: str | None = None) -> str:
+    """Secret resolution: env var -> persisted file -> generate & store on first
+    run (secrets.token_urlsafe(24)). Mirrors the Printer hub's admin-token model."""
+    if env:
+        v = os.environ.get(env, "").strip()
+        if v:
+            return v
+    try:
+        if os.path.isfile(path):
+            with open(path, encoding="utf-8") as fh:
+                tok = fh.read().strip()
+            if tok:
+                return tok
+    except Exception:
+        pass
+    tok = secrets.token_urlsafe(24)
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(tok)
+    except Exception:
+        pass
+    return tok
+
+
+ADMIN_TOKEN = _load_or_create_secret(ADMIN_TOKEN_FILE, "HUB_ADMIN_TOKEN")
+
+
+def check_admin_token(tok: str) -> bool:
+    return bool(tok) and secrets.compare_digest(str(tok), ADMIN_TOKEN)
+
 SECRET_FIELDS = (
     "SUPABASE_DB_PASSWORD",
     "SUPABASE_SERVICE_ROLE_KEY_CURRENT",
@@ -896,23 +938,30 @@ SESS_LOCK = threading.Lock()
 FAILS: dict[str, list[float]] = {}
 
 
+# Sliding idle timeout: a session with no requests for this long expires and the
+# operator must paste the admin token again (mirrors the Printer hub's 20-min idle).
+SESSION_IDLE_SECONDS = 20 * 60
+
+
 def new_session() -> str:
     tok = secrets.token_urlsafe(32)
     with SESS_LOCK:
-        SESSIONS[tok] = {"exp": time.time() + 8 * 3600, "csrf": secrets.token_urlsafe(24)}
+        SESSIONS[tok] = {"last": time.time(), "csrf": secrets.token_urlsafe(24)}
     return tok
 
 
 def get_session(tok: str | None) -> dict | None:
     if not tok:
         return None
+    now = time.time()
     with SESS_LOCK:
         s = SESSIONS.get(tok)
         if not s:
             return None
-        if s["exp"] < time.time():
-            SESSIONS.pop(tok, None)
+        if now - s["last"] > SESSION_IDLE_SECONDS:
+            SESSIONS.pop(tok, None)         # idle too long -> re-enter the admin token
             return None
+        s["last"] = now                     # activity resets the idle timer
         return s
 
 
@@ -1530,9 +1579,10 @@ LOGIN = """<!doctype html><html data-theme=light><meta charset=utf-8><title>Sign
 .mid{min-height:100vh;display:grid;place-items:center}form{width:320px}
 </style><div class=mid><form class=card method=post action=/login>
 <h1 style=margin-bottom:14px>LIMS Balance Integration</h1>
-%s<label class=mut style=font-size:13px>Password</label>
-<input name=password type=password autofocus required style=width:100%%;margin:6px 0 12px>
-<button style=width:100%%>Sign in</button></form></div>"""
+%s<label class=mut style=font-size:13px>Admin token</label>
+<input name=token type=password autofocus required placeholder="paste the admin token" style=width:100%%;margin:6px 0 12px>
+<button style=width:100%%>Sign in</button>
+<p class=mut style="font-size:11px;margin-top:10px">The admin token is generated on the collector and saved in data/admin_token.txt.</p></form></div>"""
 
 
 def esc(v) -> str:
@@ -1685,8 +1735,8 @@ def moxa_card(csrf: str, moxas: list, only_type: str, heading: str,
             f"<td><form class=inline method=post action=/moxa/del>"
             f"<input type=hidden name=csrf value='{esc(csrf)}'>"
             f"<input type=hidden name=id value='{esc(m['id'])}'>"
-            f"<input name=password type=password placeholder='password' "
-            f"size=12 required autocomplete=off>"
+            f"<input name=password type=password placeholder='admin token' "
+            f"size=16 required autocomplete=off>"
             f"<button class=ghost>Remove</button></form></tr>")
     bal_sel = "selected" if default_type == "balance" else ""
     ph_sel = "selected" if default_type == "ph_meter" else ""
@@ -1990,7 +2040,6 @@ app = FastAPI(title="LIMS Balance Integration")
 
 @app.on_event("startup")
 def _startup() -> None:
-    ensure_password()
     if configured():
         try:
             init_db()
@@ -2048,8 +2097,10 @@ def _html(body: str, code: int = 200) -> HTMLResponse:
 
 
 @app.get("/login", response_class=HTMLResponse)
-def login_page():
-    return _html(LOGIN % (CSS, ""))
+def login_page(request: Request):
+    msg = ("<p style='color:var(--warn)'>Session expired after 20 min of inactivity — "
+           "re-enter the admin token.</p>") if request.query_params.get("expired") else ""
+    return _html(LOGIN % (CSS, msg))
 
 
 @app.post("/login")
@@ -2059,7 +2110,7 @@ async def login(request: Request):
         return _html(LOGIN % (CSS, "<p style=color:var(--bad)>Too many attempts. "
                               "Wait 5 minutes.</p>"), 429)
     form = await request.form()
-    if check_pw(form.get("password", "")):
+    if check_admin_token(form.get("token", "")):
         FAILS.pop(ip, None)
         tok = new_session()
         resp = Response(status_code=303, headers={"Location": "/"})
@@ -2067,14 +2118,16 @@ async def login(request: Request):
                         samesite="strict", path="/")
         return resp
     FAILS.setdefault(ip, []).append(time.time())
-    return _html(LOGIN % (CSS, "<p style=color:var(--bad)>Wrong password.</p>"), 401)
+    return _html(LOGIN % (CSS, "<p style=color:var(--bad)>Invalid admin token.</p>"), 401)
 
 
 @app.get("/", response_class=HTMLResponse)
 def records(request: Request):
-    _, s = _sess(request)
+    tok, s = _sess(request)
     if not s:
-        return Response(status_code=303, headers={"Location": "/login"})
+        # A present-but-invalid cookie means the 20-min idle session lapsed.
+        loc = "/login?expired=1" if tok else "/login"
+        return Response(status_code=303, headers={"Location": loc})
     # Supabase configuration is mandatory -- send the user straight to Settings
     # until it is done. Nothing is captured or stored before then.
     if not configured():
@@ -2200,9 +2253,9 @@ async def moxa_del(request: Request):
     form = await request.form()
     if not _csrf_ok(form, s):
         return PlainTextResponse("bad csrf", status_code=403)
-    if not check_pw(form.get("password", "")):
+    if not check_admin_token(form.get("password", "")):
         return _html(page("<div class=card><h1>Removal refused</h1><p class=mut>"
-                          "Wrong password. The gateway was not removed.</p>"
+                          "Wrong admin token. The gateway was not removed.</p>"
                           "<p><a href=/>Back to records</a></p></div>", s["csrf"]))
     mid = (form.get("id") or "").strip()
     with ST_LOCK:
@@ -2344,11 +2397,14 @@ def main() -> int:
             return 1
         return consolidate_ph()
 
-    gen = ensure_password()
     print(f"LIMS Balance Integration  ->  http://{args.host}:{args.port}")
-    if gen:
-        print(f"\n  GENERATED PASSWORD:  {gen}\n"
-              f"  (stored hashed in {AUTH_STATE}; set BALANCE_PASSWORD in .cred to choose your own)\n")
+    # Show the admin token only on an interactive console; when run as a hidden
+    # background service the value must not land in the log -- read it from the file.
+    if os.isatty(1):
+        print(f"\n  ADMIN TOKEN:  {ADMIN_TOKEN}\n"
+              f"  (paste this to sign in; also saved in {ADMIN_TOKEN_FILE})\n")
+    else:
+        print(f"  ADMIN TOKEN: hidden -- read it from {ADMIN_TOKEN_FILE}\n")
     if not configured():
         print("  Supabase is NOT configured yet -- configuration is MANDATORY.\n"
               "  Open Settings to connect before any session can be captured.\n")
