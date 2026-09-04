@@ -1,4 +1,4 @@
-C:\Users\HP\Documents\GitHub\moxaEquipLIMS\balance_server.py:1871: DeprecationWarning: 
+C:\Users\HP\Documents\GitHub\moxaEquipLIMS\balance_server.py:2169: DeprecationWarning: 
         on_event is deprecated, use lifespan event handlers instead.
 
         Read more about it in the

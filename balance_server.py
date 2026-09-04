@@ -1786,8 +1786,26 @@ function toast(m){{const t=$('#toast');t.textContent=m;t.classList.remove('hide'
 function tick(){{const c=$('#clock');if(c)c.textContent=new Date().toLocaleTimeString();}}
 tick();setInterval(tick,1000);
 $('#refreshBtn')?.addEventListener('click',()=>location.reload());
-// Manual refresh only: the page reloads solely when the Refresh button is
-// clicked. No background polling or auto-reload.
+// The RECORDS list stays manual-refresh (reloads only on the Refresh button, so
+// it never flickers). Only the gateway CONNECTION STATUS is auto-polled below.
+
+// ---- Auto-refresh gateway status every 1s (in place, no page reload) ----
+function gwEsc(s){{s=String(s==null?'':s);return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}}
+async function pollGateways(){{
+  try{{
+    const r=await fetch('/api/gateways',{{cache:'no-store'}});
+    if(!r.ok) return;
+    const j=await r.json();
+    (j.gateways||[]).forEach(function(g){{
+      const st=document.getElementById('gwstat-'+g.id);
+      if(st) st.innerHTML='<span class=dot style=background:'+g.color+'></span><b>'+gwEsc(g.label)+'</b>'+
+        (g.detail?'<div class=mut style=font-size:11px>'+gwEsc(g.detail)+'</div>':'');
+      const se=document.getElementById('gwseen-'+g.id);
+      if(se) se.textContent=g.last_seen;
+    }});
+  }}catch(e){{}}
+}}
+setInterval(pollGateways,1000);
 
 // ---- A4 report preview + print (pH tab) ----
 function _fit(raw,w){{var L=raw.split('\\n'),m=20;for(var i=0;i<L.length;i++)m=Math.max(m,L[i].length);
@@ -1857,9 +1875,9 @@ def moxa_card(csrf: str, moxas: list, only_type: str, heading: str,
         h.append(
             f"<tr><td class=mono>{esc(m['host'])}:{m['port']}"
             f"<td>{esc(m['name'])}"
-            f"<td><span class=dot style=background:{col}></span><b>{esc(label)}</b>"
+            f"<td id=gwstat-{esc(m['id'])}><span class=dot style=background:{col}></span><b>{esc(label)}</b>"
             f"<div class=mut style=font-size:11px>{esc(detail)}</div>"
-            f"<td class=mut>{last}"
+            f"<td id=gwseen-{esc(m['id'])} class=mut>{last}"
             f"<td><form class=inline method=post action=/moxa/del>"
             f"<input type=hidden name=csrf value='{esc(csrf)}'>"
             f"<input type=hidden name=id value='{esc(m['id'])}'>"
@@ -2203,7 +2221,8 @@ SEC_HEADERS = {
     "X-Frame-Options": "DENY",
     "Referrer-Policy": "no-referrer",
     "Content-Security-Policy": ("default-src 'none'; style-src 'unsafe-inline'; "
-                               "script-src 'unsafe-inline'; form-action 'self'"),
+                               "script-src 'unsafe-inline'; connect-src 'self'; "
+                               "form-action 'self'"),
 }
 
 
@@ -2279,6 +2298,26 @@ def settings_page(request: Request):
     if not s:
         return Response(status_code=303, headers={"Location": "/login"})
     return _html(page(render_settings(s["csrf"]), s["csrf"], "settings"))
+
+
+@app.get("/api/gateways")
+def api_gateways(request: Request):
+    """Lightweight status of every gateway, polled by the dashboard once a second
+    so Connected/Disconnected updates in place without reloading the whole page."""
+    _, s = _sess(request)
+    if not s:
+        return JSONResponse({"error": "auth"}, status_code=401)
+    try:
+        moxas = db_moxa_display()
+    except Exception as exc:
+        return JSONResponse({"error": str(exc), "gateways": []})
+    out = []
+    for m in moxas:
+        label, detail, col = gateway_view(m.get("status"), m.get("last_seen"))
+        last = (str(m["last_seen"])[:19].replace("T", " ") if m.get("last_seen") else "-")
+        out.append({"id": m["id"], "label": label, "detail": detail,
+                    "color": col, "last_seen": last})
+    return JSONResponse({"gateways": out})
 
 
 @app.get("/api/tip")
