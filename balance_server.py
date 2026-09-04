@@ -1090,6 +1090,17 @@ def field(text: str, label: str) -> str:
     return m.group(1).strip() if m else ""
 
 
+def operator_of(text: str) -> str:
+    """The balance labels the operator differently across templates/brands
+    (Radwag prints 'User', others print 'Operator' / 'Operator Name'). Return the
+    first one present, ignoring the placeholder 'Signature'."""
+    for lbl in ("User", "Operator Name", "Operator"):
+        v = field(text, lbl)
+        if v and v.lower() != "signature":
+            return v
+    return ""
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
@@ -1543,7 +1554,7 @@ class Station(threading.Thread):
             sn = field(text, "Balance S/N") or field(text, "Balance Type")
             self._save("adjustment", f"{self.name}_{sn or 'NA'}_CAL",
                        [("adjustment", stamp, text)],
-                       {"balance_sn": sn, "operator": field(text, "Operator")})
+                       {"balance_sn": sn, "operator": operator_of(text)})
         elif k == "header":
             if blocks:
                 self._status(f"discarded incomplete session ({len(blocks)} blocks)")
@@ -1551,7 +1562,7 @@ class Station(threading.Thread):
             meta = {"inst_id": field(text, "INST-ID"),
                     "reg_no": field(text, "Reg No"),
                     "balance_sn": field(text, "Balance S/N"),
-                    "operator": field(text, "Operator")}
+                    "operator": operator_of(text)}
         elif k == "weight":
             if not blocks:
                 self._status("discarded weight (no header yet)")
