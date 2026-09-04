@@ -1301,6 +1301,56 @@ def outbox_submit(ev: dict) -> bool:
     return flush_outbox() == 0
 
 
+# Liveness-watchdog timings (module-level so tests can tune them).
+STATION_RX_IDLE = 20.0        # start pinging after this much silence
+STATION_PROBE_EVERY = 10.0    # ping cadence while idle
+
+
+def _ping_ok(host: str) -> bool:
+    """True if the host answers a single ICMP echo. Used as a liveness probe so a
+    MOXA that lost power / its Ethernet link is detected even when TCP keepalive
+    fails to fire. ICMP does NOT touch the instrument's serial line. If the ping
+    tool cannot be run at all, assume reachable (never false-report disconnected)."""
+    try:
+        if os.name == "nt":
+            args = ["ping", "-n", "1", "-w", "1500", host]
+        else:
+            args = ["ping", "-c", "1", "-W", "2", host]
+        r = subprocess.run(args, capture_output=True, timeout=4,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return r.returncode == 0
+    except Exception:
+        return True
+
+
+def _connect(host: str, port: int, source_port: int, timeout: float):
+    """Open a TCP connection, returning (sock, local_port). On a RECONNECT we bind
+    to the SAME local port used before (with SO_REUSEADDR): a MOXA that is still
+    holding our previous, now-dead session in its single connection slot then sees
+    the same 4-tuple, resets that stale session, and lets us right back in -- instead
+    of refusing with 'port 4001 busy with another client' until its own TCP
+    alive-check eventually frees the slot. Falls back to an ephemeral port if the
+    old one can't be reused, so it never gets stuck."""
+    attempts = ([source_port, 0] if source_port else [0])
+    last_exc: Exception = OSError("connect failed")
+    for sp in attempts:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if sp:
+                s.bind(("", sp))
+            s.settimeout(timeout)
+            s.connect((host, port))
+            return s, s.getsockname()[1]
+        except OSError as exc:
+            last_exc = exc
+            try:
+                s.close()
+            except OSError:
+                pass
+    raise last_exc
+
+
 def _enable_keepalive(sock: socket.socket) -> None:
     """Turn on TCP keepalive so a MOXA that loses power or its Ethernet link is
     detected within ~20-30s. A passive reader never notices a half-open TCP
@@ -1358,34 +1408,73 @@ class Station(threading.Thread):
         last = 0.0
         next_hb = 0.0                       # next heartbeat (monotonic seconds)
         HB = 10.0                           # heartbeat every 10s while connected
+        last_rx = 0.0                       # last time bytes were received (or connect)
+        next_probe = 0.0                    # next liveness ping
+        ping_fails = 0
+        RX_IDLE = STATION_RX_IDLE           # start pinging after this much silence
+        PROBE_EVERY = STATION_PROBE_EVERY   # ping cadence while idle
+        local_port = 0                      # reuse this src port on reconnect (stale-slot fix)
         blocks: list[tuple[str, str, str]] = []
         meta: dict[str, str] = {}
         while not self.stop.is_set():
             if sock is None:
                 try:
-                    sock = socket.create_connection((self.host, self.port), timeout=5)
+                    sock, local_port = _connect(self.host, self.port, local_port, 4)
                     _enable_keepalive(sock)
                     sock.settimeout(0.2)
                     self._status("connected")
-                    next_hb = time.monotonic() + HB
+                    now_c = time.monotonic()
+                    next_hb = now_c + HB
+                    last_rx = now_c
+                    next_probe = now_c + PROBE_EVERY
+                    ping_fails = 0
                 except ConnectionRefusedError:
-                    self._status(f"refused: port {self.port} in use by another client, "
-                                 f"or that NPort serial port is not set to TCP Server mode")
-                    time.sleep(5)
+                    # The MOXA answered but refused: either the serial port is not in
+                    # TCP Server mode, or (after a cable pull) it is still holding the
+                    # OLD/stale session in its single connection slot. Keep retrying
+                    # briskly -- it clears once the NPort's TCP alive-check drops the
+                    # stale session (or immediately if Max Connection > 1).
+                    self._status(f"refused: port {self.port} busy (stale session on the NPort) "
+                                 f"or not in TCP Server mode -- retrying")
+                    time.sleep(2)
                     continue
-                except OSError as exc:
+                except OSError:
                     # Host unreachable / timeout / no route -> the collector cannot
                     # reach the MOXA (its Ethernet cable is unplugged, or the network
                     # is down). Report a single, unambiguous state the UI maps to
                     # "Not Connected to the Server. Please plug in the Ethernet cable."
+                    # Keep retrying so it reconnects on its own the moment the MOXA is
+                    # reachable again (no restart needed).
                     self._status("disconnected")
-                    time.sleep(5)
+                    time.sleep(2)
                     continue
             # Heartbeat: refresh last_seen while connected (even when idle) so the
             # Hub/LIMS can tell a live collector from a dead one.
             if sock is not None and time.monotonic() >= next_hb:
                 self._touch()
                 next_hb = time.monotonic() + HB
+            # Liveness watchdog: recv() on a half-open socket just times out with no
+            # error, so a passive reader can miss a MOXA that lost power / its cable.
+            # After some silence, ICMP-ping the device; two consecutive failures mean
+            # it is truly gone -> drop the dead socket and reconnect. This guarantees
+            # the station never stays stuck "connected" on a dead link (no re-add
+            # needed). ICMP never reaches the instrument's serial line.
+            now_m = time.monotonic()
+            if sock is not None and (now_m - last_rx) > RX_IDLE and now_m >= next_probe:
+                next_probe = now_m + PROBE_EVERY
+                if _ping_ok(self.host):
+                    ping_fails = 0
+                else:
+                    ping_fails += 1
+                    if ping_fails >= 2:
+                        self._status("disconnected")
+                        try:
+                            sock.close()
+                        except OSError:
+                            pass
+                        sock = None
+                        ping_fails = 0
+                        continue
             try:
                 chunk = sock.recv(8192)
                 if not chunk:
@@ -1405,6 +1494,7 @@ class Station(threading.Thread):
             if chunk:
                 buf.extend(chunk)
                 last = time.monotonic()
+                last_rx = last
 
             if buf and last and (time.monotonic() - last) > self.gap:
                 whole = bytes(buf).decode(self.codepage, errors="replace")
