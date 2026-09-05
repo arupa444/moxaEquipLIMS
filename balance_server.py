@@ -481,6 +481,8 @@ CREATE TABLE IF NOT EXISTS public."moxaServers" (
 );
 ALTER TABLE public."moxaServers"
   ADD COLUMN IF NOT EXISTS instrument_type text NOT NULL DEFAULT 'balance';
+ALTER TABLE public."moxaServers"
+  ADD COLUMN IF NOT EXISTS equipment_id text;
 
 CREATE TABLE IF NOT EXISTS public.ph_meter_data (
   id                  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -550,8 +552,9 @@ CREATE TABLE IF NOT EXISTS public.balance_integration_data (
   UNIQUE (moxa_id, started_at, label)
 );
 
-GRANT SELECT (id, host, port, name, instrument_type, enabled, status, last_seen,
-              collector_id, created_at, updated_at) ON public."moxaServers" TO authenticated;
+GRANT SELECT (id, host, port, name, instrument_type, equipment_id, enabled, status,
+              last_seen, collector_id, created_at, updated_at)
+       ON public."moxaServers" TO authenticated;
 GRANT SELECT ON public.balance_integration_data TO authenticated;
 GRANT SELECT ON public.ph_meter_data TO authenticated;
 GRANT ALL ON public."moxaServers" TO service_role;
@@ -659,15 +662,44 @@ def init_db() -> None:
 def db_list_enabled_moxa() -> list[dict]:
     if _via_rest():
         rows = _rest("GET", "moxaServers",
-                     {"select": "id,host,port,name,instrument_type",
+                     {"select": "id,host,port,name,instrument_type,equipment_id",
                       "enabled": "eq.true"}) or []
         return [{"id": r["id"], "host": r["host"], "port": r["port"],
                  "name": r["name"],
-                 "instrument_type": r.get("instrument_type") or "balance"}
+                 "instrument_type": r.get("instrument_type") or "balance",
+                 "equipment_id": r.get("equipment_id")}
                 for r in rows]
     return q('SELECT id::text AS id, host, port, name, '
-             'COALESCE(instrument_type, \'balance\') AS instrument_type '
+             'COALESCE(instrument_type, \'balance\') AS instrument_type, '
+             'equipment_id '
              'FROM public."moxaServers" WHERE enabled=true')
+
+
+def db_list_equipment() -> list[dict]:
+    """Equipment choices for the Add-equipment dropdown, from the connected DB's
+    `equipment` table (latest revision only). Returns [{equipment_id, name, code}]
+    sorted by name."""
+    try:
+        if _via_rest():
+            rows = _rest("GET", "equipment",
+                         {"select": "equipment_id,name,code",
+                          "is_latest": "eq.true",
+                          "order": "name.asc"}) or []
+        else:
+            rows = q('SELECT equipment_id, name, code '
+                     'FROM public.equipment WHERE is_latest=true '
+                     'ORDER BY name ASC')
+    except Exception:
+        return []
+    out = []
+    for r in rows:
+        eid = r.get("equipment_id")
+        if not eid:
+            continue
+        out.append({"equipment_id": eid,
+                    "name": r.get("name") or "",
+                    "code": r.get("code") or ""})
+    return out
 
 
 def db_set_status(mid: str, status: str) -> None:
@@ -712,10 +744,12 @@ def db_insert_session(row: dict) -> None:
 
 
 def db_upsert_moxa(host: str, port: int, name: str, pw_enc: str | None,
-                   instrument_type: str = "balance") -> None:
+                   instrument_type: str = "balance",
+                   equipment_id: str | None = None) -> None:
     if _via_rest():
         body = {"host": host, "port": port, "name": name,
-                "instrument_type": instrument_type, "enabled": True,
+                "instrument_type": instrument_type,
+                "equipment_id": equipment_id, "enabled": True,
                 "status": "idle", "collector_id": COLLECTOR_ID, "updated_at": now_iso()}
         if pw_enc is not None:
             body["moxa_password_enc"] = pw_enc
@@ -723,14 +757,15 @@ def db_upsert_moxa(host: str, port: int, name: str, pw_enc: str | None,
               prefer="resolution=merge-duplicates,return=minimal")
     else:
         ex('INSERT INTO public."moxaServers" (host, port, name, instrument_type, '
-           'enabled, status, moxa_password_enc, collector_id) '
-           'VALUES (%s,%s,%s,%s,true,\'idle\',%s,%s) '
+           'equipment_id, enabled, status, moxa_password_enc, collector_id) '
+           'VALUES (%s,%s,%s,%s,%s,true,\'idle\',%s,%s) '
            'ON CONFLICT (host) DO UPDATE SET port=excluded.port, name=excluded.name, '
-           'instrument_type=excluded.instrument_type, enabled=true, status=\'idle\', '
+           'instrument_type=excluded.instrument_type, '
+           'equipment_id=excluded.equipment_id, enabled=true, status=\'idle\', '
            'collector_id=excluded.collector_id, '
            'moxa_password_enc=COALESCE(excluded.moxa_password_enc, '
            'public."moxaServers".moxa_password_enc), updated_at=now()',
-           (host, port, name, instrument_type, pw_enc, COLLECTOR_ID))
+           (host, port, name, instrument_type, equipment_id, pw_enc, COLLECTOR_ID))
 
 
 def db_all_ph_rows() -> list[dict]:
@@ -811,11 +846,12 @@ def db_disable_moxa(mid: str) -> None:
 def db_moxa_display() -> list[dict]:
     if _via_rest():
         return _rest("GET", "moxaServers",
-                     {"select": "id,host,port,name,instrument_type,status,last_seen",
+                     {"select": "id,host,port,name,instrument_type,equipment_id,"
+                                "status,last_seen",
                       "enabled": "eq.true", "order": "created_at.asc"}) or []
     return q('SELECT id::text AS id, host, port, name, '
              'COALESCE(instrument_type, \'balance\') AS instrument_type, '
-             'status, last_seen '
+             'equipment_id, status, last_seen '
              'FROM public."moxaServers" WHERE enabled=true ORDER BY created_at')
 
 
@@ -1394,10 +1430,12 @@ class Station(threading.Thread):
     daemon = True
 
     def __init__(self, mid: str, host: str, port: int, name: str,
-                 itype: str = "balance", gap: float = GAP):
+                 itype: str = "balance", gap: float = GAP,
+                 equipment_id: str | None = None):
         super().__init__(name=f"moxa-{host}")
         self.mid, self.host, self.port, self.name, self.gap = mid, host, port, name, gap
         self.itype = itype or "balance"
+        self.equipment_id = equipment_id
         self.codepage = PH_CODEPAGE if self.itype == "ph_meter" else CODEPAGE
         self.stop = threading.Event()
 
@@ -1532,7 +1570,8 @@ class Station(threading.Thread):
         ev = {"op": "ph", "moxa_id": self.mid, "moxa_name": self.name,
               "moxa_host": self.host, "captured_at": now_iso(), "bytes": total,
               "raw_text": text,
-              "p": {"report_type": p["report_type"], "instrument_id": p["instrument_id"],
+              "p": {"report_type": p["report_type"],
+                    "instrument_id": p["instrument_id"] or self.equipment_id,
                     "instrument_sr_no": p["instrument_sr_no"], "operator": p["operator"],
                     "printed_at": p["printed_at"], "is_sample": p["is_sample"],
                     "registration_numbers": p["registration_numbers"], "rows": p["rows"],
@@ -1583,7 +1622,8 @@ class Station(threading.Thread):
     def _flush(self, blocks: list, meta: dict) -> None:
         if not blocks:
             return
-        label = f"{self.name}_{meta.get('inst_id') or 'NA'}_{meta.get('reg_no') or 'NA'}"
+        inst = meta.get("inst_id") or self.equipment_id
+        label = f"{self.name}_{inst or 'NA'}_{meta.get('reg_no') or 'NA'}"
         self._save("weighing", label, blocks, meta)
 
     def _save(self, kind: str, label: str, blocks: list, meta: dict) -> None:
@@ -1592,7 +1632,8 @@ class Station(threading.Thread):
         payload = [{"seq": i, "kind": b[0], "received": b[1], "body": b[2]}
                    for i, b in enumerate(blocks)]
         row = {"moxa_id": self.mid, "moxa_name": self.name, "moxa_host": self.host,
-               "kind": kind, "label": label, "inst_id": meta.get("inst_id"),
+               "kind": kind, "label": label,
+               "inst_id": meta.get("inst_id") or self.equipment_id,
                "reg_no": meta.get("reg_no"), "balance_sn": meta.get("balance_sn"),
                "operator": meta.get("operator"), "started_at": blocks[0][1],
                "finished_at": blocks[-1][1], "raw_text": raw_text,
@@ -1624,9 +1665,13 @@ def sync_stations() -> None:
         for mid, r in want.items():
             if mid not in STATIONS or not STATIONS[mid].is_alive():
                 st = Station(mid, r["host"], r["port"], r["name"] or r["host"],
-                             r.get("instrument_type", "balance"))
+                             r.get("instrument_type", "balance"),
+                             equipment_id=r.get("equipment_id"))
                 STATIONS[mid] = st
                 st.start()
+            else:
+                # live station: refresh the stamping value if it changed (no restart)
+                STATIONS[mid].equipment_id = r.get("equipment_id")
 
 
 # ----------------------------------------------------------------- UI ---
@@ -1864,17 +1909,23 @@ def gateway_view(status: str | None, last_seen) -> tuple[str, str, str]:
 
 
 def moxa_card(csrf: str, moxas: list, only_type: str, heading: str,
-              default_type: str) -> str:
+              default_type: str, equipment: list | None = None) -> str:
     """Gateway table + add-form for one instrument type. Used by both tabs."""
+    equipment = equipment or []
+    eq_name = {e["equipment_id"]: (e.get("name") or e["equipment_id"])
+               for e in equipment}
     shown = [m for m in moxas if (m.get("instrument_type") or "balance") == only_type]
     h = [f"<div class=card><h1>{esc(heading)}</h1><table><tr><th>IP<th>Name of the Device"
-         "<th>Status<th>Last seen<th></tr>"]
+         "<th>Equipment<th>Status<th>Last seen<th></tr>"]
     for m in shown:
         label, detail, col = gateway_view(m.get("status"), m.get("last_seen"))
         last = esc(str(m["last_seen"])[:19].replace("T", " ") if m["last_seen"] else "-")
+        eid = m.get("equipment_id")
+        eq_disp = eq_name.get(eid, eid) if eid else "-"
         h.append(
             f"<tr><td class=mono>{esc(m['host'])}:{m['port']}"
             f"<td>{esc(m['name'])}"
+            f"<td>{esc(str(eq_disp))}"
             f"<td id=gwstat-{esc(m['id'])}><span class=dot style=background:{col}></span><b>{esc(label)}</b>"
             f"<div class=mut style=font-size:11px>{esc(detail)}</div>"
             f"<td id=gwseen-{esc(m['id'])} class=mut>{last}"
@@ -1886,6 +1937,14 @@ def moxa_card(csrf: str, moxas: list, only_type: str, heading: str,
             f"<button class=ghost>Remove</button></form></tr>")
     bal_sel = "selected" if default_type == "balance" else ""
     ph_sel = "selected" if default_type == "ph_meter" else ""
+    eq_opts = ["<option value=''>Equipment (from LIMS)</option>"]
+    for e in equipment:
+        lbl = e.get("name") or e["equipment_id"]
+        code = e.get("code")
+        if code and code not in lbl:
+            lbl = f"{lbl} ({code})"
+        eq_opts.append(
+            f"<option value='{esc(e['equipment_id'])}'>{esc(str(lbl))}</option>")
     h.append("</table><form class='inline' method=post action=/moxa/add "
              "style=margin-top:14px>"
              f"<input type=hidden name=csrf value='{esc(csrf)}'>"
@@ -1894,6 +1953,8 @@ def moxa_card(csrf: str, moxas: list, only_type: str, heading: str,
              "<select name=instrument_type title='Instrument type'>"
              f"<option value=balance {bal_sel}>Balance</option>"
              f"<option value=ph_meter {ph_sel}>pH Meter</option></select>"
+             "<select name=equipment_id title='Equipment (Instrument ID from the LIMS)'>"
+             f"{''.join(eq_opts)}</select>"
              "<input name=name placeholder='Name of the Device (server name from the MOXA panel)'>"
              "<input name=moxa_password type=password placeholder='device password (stored encrypted)' autocomplete=off>"
              "<button>Add equipment</button></form></div>")
@@ -1910,9 +1971,11 @@ def render(csrf: str) -> str:
                 f"<p class=mut>Could not reach Supabase: {esc(exc)}</p>"
                 f"<p><a href=/settings>Check settings</a></p></div>")
 
+    equipment = db_list_equipment()
     n_bal = sum(1 for m in moxas if (m.get("instrument_type") or "balance") == "balance")
     m_html = [moxa_card(csrf, moxas, "balance",
-                        "Balance Equipment / MOXA gateways", "balance")]
+                        "Balance Equipment / MOXA gateways", "balance",
+                        equipment=equipment)]
 
     queued = outbox_count()
     q_col = "var(--bad)" if queued else "var(--mut)"
@@ -1997,7 +2060,8 @@ def render_ph(csrf: str) -> str:
         moxas = db_moxa_display()
     except Exception:
         moxas = []
-    g_html = moxa_card(csrf, moxas, "ph_meter", "Equipment / MOXA gateways", "ph_meter")
+    g_html = moxa_card(csrf, moxas, "ph_meter", "Equipment / MOXA gateways",
+                       "ph_meter", equipment=db_list_equipment())
     try:
         ph_rows = db_ph_reports(200)
         ph_tot = db_ph_count()
@@ -2399,10 +2463,11 @@ async def moxa_add(request: Request):
     itype = (form.get("instrument_type") or "balance").strip()
     if itype not in ("balance", "ph_meter"):
         itype = "balance"
+    equipment_id = (form.get("equipment_id") or "").strip() or None
     pw = (form.get("moxa_password") or "").strip()
     pw_enc = encrypt_secret(pw) if pw else None
     try:
-        db_upsert_moxa(host, port, name, pw_enc, itype)
+        db_upsert_moxa(host, port, name, pw_enc, itype, equipment_id)
     except Exception as exc:
         return _html(page(f"<div class=card><h1>Could not add gateway</h1>"
                           f"<p class=mut>{esc(exc)}</p><p><a href=/>Back</a></p></div>",
