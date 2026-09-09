@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import collections
 import hashlib
 import hmac
 import html
@@ -1424,6 +1425,41 @@ def _enable_keepalive(sock: socket.socket) -> None:
                     pass
 
 
+# Raw-tap size limits. The tap exists so a commissioning engineer can see what
+# the instrument actually sent, including bytes the parser rejects -- without
+# opening a second TCP connection (RADWAG balances and NPorts alike accept only
+# ONE client, so a separate probe tool cannot run while the hub is connected).
+RAW_MAX_CHUNKS = 200          # most recent recv() chunks kept per station
+RAW_MAX_BYTES = 64 * 1024     # hard cap on retained bytes per station
+
+# Read-only RADWAG commands the diagnostics bar may send. Taken verbatim from
+# the verified table in RADWAG.md -- every one of these only *reports* state.
+#
+# Everything else is refused, deliberately. The balance also accepts commands
+# that calibrate (IC/IC0/IC1), zero or tare (Z/T/NT), drive the draft-shield
+# doors (OD/CD/ODH/OUH/OC), lock the keypad (K0/K1), start continuous
+# transmission (C0/C1), and reboot (RBT.*) -- none of which belong behind a
+# web button on a GxP instrument. A whitelist, not a blacklist, so a typo
+# cannot reach them.
+SAFE_COMMANDS: dict[str, str] = {
+    "SUI":         "mass + unit, immediately (no stability wait)",
+    "SU":          "mass + unit, waits for a stable reading",
+    "S":           "mass in the calibration unit, waits for stability",
+    "OT":          "current tare value",
+    "UG":          "current unit",
+    "UI":          "all available units",
+    "SN":          "serial number",
+    "NB":          "serial number (alternate command)",
+    "RV":          "firmware version",
+    "WINFO":       "device name, type, MAC, platform count",
+    "PID":         "product id",
+    "OMG":         "current operating mode",
+    "OMI":         "available operating modes",
+    "GET_AMBIENT": "temperature, humidity, pressure, air density",
+    "WP":          "current printout template",
+}
+
+
 class Station(threading.Thread):
     """One MOXA: own socket, own buffer, own session queue -> Supabase."""
 
@@ -1438,6 +1474,50 @@ class Station(threading.Thread):
         self.equipment_id = equipment_id
         self.codepage = PH_CODEPAGE if self.itype == "ph_meter" else CODEPAGE
         self.stop = threading.Event()
+        # Raw tap: (iso_timestamp, bytes) per recv(). deque.append/popleft are
+        # atomic under the GIL, so the reader thread needs no lock.
+        self.raw: collections.deque = collections.deque(maxlen=RAW_MAX_CHUNKS)
+        self.raw_total = 0            # lifetime bytes received on this station
+        # Outbound diagnostics queue. The web thread appends, the station thread
+        # drains and writes -- so only ONE thread ever touches the socket.
+        self.tx: collections.deque = collections.deque(maxlen=16)
+
+    def queue_command(self, cmd: str) -> None:
+        """Ask the station thread to send one read-only command. Rejected here
+        rather than at the socket so an unknown command never reaches the
+        instrument."""
+        if cmd not in SAFE_COMMANDS:
+            raise ValueError(f"{cmd!r} is not in the read-only whitelist")
+        self.tx.append(cmd)
+
+    def _drain_tx(self, sock: socket.socket) -> None:
+        """Send any queued diagnostic commands. Called only from run()."""
+        while self.tx:
+            try:
+                cmd = self.tx.popleft()
+            except IndexError:
+                return
+            try:
+                sock.sendall((cmd + "\r\n").encode("ascii"))
+                self._tap_note(f"--> sent {cmd}")
+            except OSError as exc:
+                self._tap_note(f"--> send {cmd} FAILED: {exc}")
+                return
+
+    def _tap_note(self, note: str) -> None:
+        """Record an outbound command in the tap, so what we sent is interleaved
+        with what came back, in order."""
+        self.raw.append((now_iso(), note.encode("ascii", "replace"), "tx"))
+
+    def _tap(self, chunk: bytes) -> None:
+        """Record a received chunk for the diagnostics view, then trim to the
+        byte cap so a chatty instrument (continuous transmission) cannot grow
+        the buffer without bound."""
+        self.raw.append((now_iso(), chunk, "rx"))
+        self.raw_total += len(chunk)
+        held = sum(len(c) for _, c, _k in self.raw)
+        while held > RAW_MAX_BYTES and len(self.raw) > 1:
+            held -= len(self.raw.popleft()[1])
 
     def _status(self, s: str) -> None:
         try:
@@ -1524,6 +1604,11 @@ class Station(threading.Thread):
                         sock = None
                         ping_fails = 0
                         continue
+            # Diagnostics: send any queued read-only command. Only this thread
+            # ever writes to the socket, so no write lock is needed.
+            if self.tx:
+                self._drain_tx(sock)
+
             try:
                 chunk = sock.recv(8192)
                 if not chunk:
@@ -1541,6 +1626,7 @@ class Station(threading.Thread):
                 continue
 
             if chunk:
+                self._tap(chunk)
                 buf.extend(chunk)
                 last = time.monotonic()
                 last_rx = last
@@ -1852,6 +1938,105 @@ async function pollGateways(){{
 }}
 setInterval(pollGateways,1000);
 
+// ---- Raw tap: what the instrument actually sent -----------------------------
+// The parser only stores a record once a full header->weight->footer session
+// arrives, so bytes it rejects leave no trace beyond a 'discarded ...' status.
+// This shows the real bytes (decoded + hex) from the socket the collector is
+// already holding -- no second connection, which matters because balances and
+// NPorts accept only one TCP client.
+var NL='\\n';
+var _rawTimer={{}};
+var RAW_EMPTY=[
+  '',
+  '(nothing received yet)',
+  '',
+  'The socket is open but the instrument has sent no bytes. Press PRINT on the',
+  'balance. If this stays empty the instrument is not routing its printout to',
+  'this port -- on a RADWAG 4Y check',
+  '    SETUP -> Peripherals -> Printer -> Port -> Ethernet',
+  'and confirm the weighing printout template is not empty.'
+].join(NL);
+async function loadRaw(id){{
+  const box=document.getElementById('gwraw-'+id);
+  const body=document.getElementById('gwrawbody-'+id);
+  if(!box||!body) return;
+  try{{
+    const r=await fetch('/api/raw?id='+encodeURIComponent(id),{{cache:'no-store'}});
+    const j=await r.json();
+    if(j.error){{ body.textContent=j.error; return; }}
+    const head='# '+j.host+'  codepage='+j.codepage+'  '+j.total+
+               ' bytes received lifetime, showing last '+j.held+NL;
+    if(!(j.chunks||[]).length){{ body.textContent=head+RAW_EMPTY; return; }}
+    body.textContent=head+j.chunks.map(function(c){{
+      return NL+'['+c.at+']  '+c.bytes+' bytes'+NL+c.text+NL+'hex: '+c.hex;
+    }}).join(NL);
+    body.scrollTop=body.scrollHeight;
+  }}catch(e){{ body.textContent='could not read raw tap: '+e; }}
+}}
+function toggleRaw(id){{
+  const box=document.getElementById('gwraw-'+id);
+  if(!box) return;
+  const open=box.classList.toggle('hide')===false;
+  if(open){{ loadRaw(id); _rawTimer[id]=setInterval(function(){{loadRaw(id);}},1000); }}
+  else {{ clearInterval(_rawTimer[id]); delete _rawTimer[id]; }}
+}}
+
+// ---- Diagnostics: query the instrument, and detect TCP-client mode ---------
+// csrf is already on every page in the sign-out form; reuse it.
+function _csrf(){{var e=document.querySelector('input[name=csrf]');return e?e.value:'';}}
+async function sendCmd(id){{
+  const sel=document.getElementById('gwcmd-'+id);
+  const body=document.getElementById('gwrawbody-'+id);
+  if(!sel||!body) return;
+  const fd=new FormData();
+  fd.append('csrf',_csrf()); fd.append('id',id); fd.append('cmd',sel.value);
+  try{{
+    const r=await fetch('/api/diag/send',{{method:'POST',body:fd}});
+    const j=await r.json();
+    toast(j.error?('query refused: '+j.error):('sent '+j.queued+' -- watch below'));
+  }}catch(e){{ toast('query failed: '+e); }}
+  loadRaw(id);
+}}
+async function diagListen(id,port){{
+  const body=document.getElementById('gwrawbody-'+id);
+  if(!body) return;
+  clearInterval(_rawTimer[id]);              // stop the rx poll; this view replaces it
+  const fd=new FormData();
+  fd.append('csrf',_csrf()); fd.append('port',port);
+  try{{ await fetch('/api/diag/listen',{{method:'POST',body:fd}}); }}
+  catch(e){{ body.textContent='could not start listener: '+e; return; }}
+  toast('listening on '+port+' -- press PRINT on the instrument');
+  async function poll(){{
+    try{{
+      const r=await fetch('/api/diag/listen?port='+port,{{cache:'no-store'}});
+      const j=await r.json();
+      var out=['# inbound listener on port '+j.port+
+               (j.running?'  (running)':'  (finished)')];
+      if(j.error) out.push('', 'ERROR: '+j.error);
+      out.push('', 'connections seen: '+(j.peers.length?j.peers.join(', '):'none'),
+               'bytes received: '+j.bytes);
+      if(j.bytes){{
+        out.push('', 'The instrument is in TCP-CLIENT mode -- it dials us. The',
+                    'collector only dials OUT, so it can never receive this.',
+                    'Switch the balance to TCP server mode:',
+                    '    SETUP -> Communication -> Tcp -> Port 4001',
+                    '', '--- what it sent ---', j.text);
+      }} else if(!j.running){{
+        out.push('', 'Nothing dialled in. The instrument is NOT in TCP-client',
+                    'mode, so that is ruled out. If the row still will not',
+                    'connect, the fault is reachability -- recheck the IP, mask',
+                    'and VLAN (section 3 of RADWAG_LAN.md).');
+      }} else {{
+        out.push('', 'Waiting... press PRINT on the instrument now.');
+      }}
+      body.textContent=out.join(NL);
+      if(j.running) setTimeout(poll,1000);
+      else _rawTimer[id]=setInterval(function(){{loadRaw(id);}},1000);
+    }}catch(e){{ body.textContent='listener poll failed: '+e; }}
+  }}
+  poll();
+}}
+
 // ---- A4 report preview + print (pH tab) ----
 function _fit(raw,w){{var L=raw.split('\\n'),m=20;for(var i=0;i<L.length;i++)m=Math.max(m,L[i].length);
   return Math.max(9,Math.min(18,w/(m*0.62)));}}
@@ -1915,6 +2100,9 @@ def moxa_card(csrf: str, moxas: list, only_type: str, heading: str,
     eq_name = {e["equipment_id"]: (e.get("name") or e["equipment_id"])
                for e in equipment}
     shown = [m for m in moxas if (m.get("instrument_type") or "balance") == only_type]
+    # Read-only query commands offered in each row's diagnostics bar.
+    cmd_opts = "".join(f"<option value='{esc(c)}'>{esc(c)} — {esc(d)}</option>"
+                       for c, d in SAFE_COMMANDS.items())
     h = [f"<div class=card><h1>{esc(heading)}</h1><table><tr><th>IP<th>Name of the Device"
          "<th>Equipment<th>Status<th>Last seen<th></tr>"]
     for m in shown:
@@ -1929,12 +2117,32 @@ def moxa_card(csrf: str, moxas: list, only_type: str, heading: str,
             f"<td id=gwstat-{esc(m['id'])}><span class=dot style=background:{col}></span><b>{esc(label)}</b>"
             f"<div class=mut style=font-size:11px>{esc(detail)}</div>"
             f"<td id=gwseen-{esc(m['id'])} class=mut>{last}"
-            f"<td><form class=inline method=post action=/moxa/del>"
+            f"<td><button class=ghost type=button "
+            f"onclick=\"toggleRaw('{esc(m['id'])}')\" "
+            f"title='Show the raw bytes this instrument has sent'>Raw</button>"
+            f"<form class=inline method=post action=/moxa/del>"
             f"<input type=hidden name=csrf value='{esc(csrf)}'>"
             f"<input type=hidden name=id value='{esc(m['id'])}'>"
             f"<input name=password type=password placeholder='admin token' "
             f"size=16 required autocomplete=off>"
-            f"<button class=ghost>Remove</button></form></tr>")
+            f"<button class=ghost>Remove</button></form></tr>"
+            f"<tr id=gwraw-{esc(m['id'])} class=hide><td colspan=6>"
+            f"<div class=mut style=font-size:11px>Raw bytes received from "
+            f"{esc(m['host'])} — decoded plus hex, newest last. Live while open. "
+            f"This is the collector's own socket, so nothing else needs to "
+            f"connect.</div>"
+            f"<div class=inline style=margin:8px 0>"
+            f"<select id=gwcmd-{esc(m['id'])} title='Read-only query commands'>"
+            f"{cmd_opts}</select>"
+            f"<button class=ghost type=button "
+            f"onclick=\"sendCmd('{esc(m['id'])}')\">Send query</button>"
+            f"<button class=ghost type=button "
+            f"onclick=\"diagListen('{esc(m['id'])}',{m['port']})\" "
+            f"title='Check whether the instrument is dialling us instead of "
+            f"listening (TCP-client mode)'>Listen for inbound</button>"
+            f"</div>"
+            f"<pre id=gwrawbody-{esc(m['id'])} "
+            f"style=max-height:320px;overflow:auto>loading…</pre></tr>")
     bal_sel = "selected" if default_type == "balance" else ""
     ph_sel = "selected" if default_type == "ph_meter" else ""
     eq_opts = ["<option value=''>Equipment (from LIMS)</option>"]
@@ -2382,6 +2590,167 @@ def api_gateways(request: Request):
         out.append({"id": m["id"], "label": label, "detail": detail,
                     "color": col, "last_seen": last})
     return JSONResponse({"gateways": out})
+
+
+@app.get("/api/raw")
+def api_raw(request: Request, id: str = ""):
+    """Raw bytes most recently received from one gateway, newest last.
+
+    Commissioning aid. The parser only stores a record once a full
+    header -> weight -> footer session arrives, so bytes it rejects are
+    otherwise invisible -- the status line says 'discarded ...' and the text is
+    gone. This shows the actual bytes, decoded and in hex, so a wrong printout
+    template or unexpected framing is visible without opening a second TCP
+    connection to an instrument that only accepts one client.
+    """
+    _, s = _sess(request)
+    if not s:
+        return JSONResponse({"error": "auth"}, status_code=401)
+    with ST_LOCK:
+        st = STATIONS.get(id)
+    if st is None:
+        return JSONResponse({"error": "no live station for that gateway "
+                                     "(disabled, removed, or never connected)",
+                             "chunks": [], "total": 0}, status_code=404)
+    chunks = [{"at": at,
+               "dir": kind,
+               "bytes": len(c),
+               "text": c.decode(st.codepage, errors="replace"),
+               "hex": c.hex(" ") if kind == "rx" else ""}
+              for at, c, kind in list(st.raw)]
+    return JSONResponse({"host": f"{st.host}:{st.port}", "name": st.name,
+                         "codepage": st.codepage, "total": st.raw_total,
+                         "held": sum(x["bytes"] for x in chunks if x["dir"] == "rx"),
+                         "commands": SAFE_COMMANDS,
+                         "chunks": chunks})
+
+
+@app.post("/api/diag/send")
+async def api_diag_send(request: Request):
+    """Send ONE read-only command down the collector's existing socket.
+
+    The reply lands in the raw tap like any other inbound bytes, so the command
+    and its answer appear interleaved in the Raw panel. Restricted to
+    SAFE_COMMANDS -- see the comment on that table for why it is a whitelist.
+    """
+    _, s = _sess(request)
+    if not s:
+        return JSONResponse({"error": "auth"}, status_code=401)
+    form = await request.form()
+    if not _csrf_ok(form, s):
+        return JSONResponse({"error": "bad csrf"}, status_code=403)
+    mid = (form.get("id") or "").strip()
+    cmd = (form.get("cmd") or "").strip().upper()
+    with ST_LOCK:
+        st = STATIONS.get(mid)
+    if st is None:
+        return JSONResponse({"error": "no live station for that gateway"},
+                            status_code=404)
+    try:
+        st.queue_command(cmd)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    return JSONResponse({"queued": cmd, "note": "watch the Raw panel for the reply"})
+
+
+# One-shot inbound listeners, keyed by port. Diagnoses an instrument configured
+# as a TCP *client*: the collector only ever dials out, so a balance that dials
+# US is invisible to it -- the gateway row just says 'disconnected' forever with
+# no hint as to why. This listens briefly and reports what connected.
+LISTENERS: dict[int, dict] = {}
+LISTEN_LOCK = threading.Lock()
+LISTEN_SECONDS = 120
+
+
+def _listen_once(port: int, seconds: int) -> None:
+    """Accept inbound connections on `port` for `seconds`, recording peers and
+    bytes into LISTENERS[port]. Runs on its own daemon thread."""
+    state = LISTENERS[port]
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        # Deliberately NO SO_REUSEADDR: on Windows it lets this socket bind a
+        # port another process already holds and silently steal its traffic. A
+        # listening socket never sits in TIME_WAIT, so the option buys nothing
+        # here -- and without it a port clash is reported instead of hidden.
+        srv.bind(("0.0.0.0", port))
+        srv.listen(1)
+        srv.settimeout(1.0)
+    except OSError as exc:
+        state["done"] = True
+        state["error"] = (f"cannot listen on {port}: {exc}. Something else on this "
+                          f"PC already holds the port.")
+        srv.close()
+        return
+    deadline = time.monotonic() + seconds
+    try:
+        while time.monotonic() < deadline:
+            try:
+                conn, addr = srv.accept()
+            except socket.timeout:
+                continue
+            state["peers"].append(f"{addr[0]}:{addr[1]}")
+            conn.settimeout(1.0)
+            with conn:
+                while time.monotonic() < deadline:
+                    try:
+                        chunk = conn.recv(8192)
+                    except socket.timeout:
+                        continue
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    state["bytes"] += len(chunk)
+                    state["text"].append(chunk.decode(CODEPAGE, errors="replace"))
+    finally:
+        srv.close()
+        state["done"] = True
+
+
+@app.post("/api/diag/listen")
+async def api_diag_listen(request: Request):
+    """Start a temporary inbound listener, or report a running one's result."""
+    _, s = _sess(request)
+    if not s:
+        return JSONResponse({"error": "auth"}, status_code=401)
+    form = await request.form()
+    if not _csrf_ok(form, s):
+        return JSONResponse({"error": "bad csrf"}, status_code=403)
+    try:
+        port = max(1, min(65535, int(form.get("port") or DEFAULT_PORT)))
+    except ValueError:
+        return JSONResponse({"error": "bad port"}, status_code=400)
+    with LISTEN_LOCK:
+        cur = LISTENERS.get(port)
+        if cur is None or cur.get("done"):
+            LISTENERS[port] = {"peers": [], "bytes": 0, "text": [], "done": False,
+                               "error": "", "started": now_iso(),
+                               "seconds": LISTEN_SECONDS}
+            threading.Thread(target=_listen_once, args=(port, LISTEN_SECONDS),
+                             daemon=True, name=f"diag-listen-{port}").start()
+        state = LISTENERS[port]
+    return JSONResponse({"port": port, "started": state["started"],
+                         "seconds": state["seconds"], "done": state["done"],
+                         "error": state["error"], "peers": state["peers"],
+                         "bytes": state["bytes"],
+                         "text": "".join(state["text"])[-8192:]})
+
+
+@app.get("/api/diag/listen")
+def api_diag_listen_status(request: Request, port: int = 0):
+    _, s = _sess(request)
+    if not s:
+        return JSONResponse({"error": "auth"}, status_code=401)
+    port = port or DEFAULT_PORT
+    with LISTEN_LOCK:
+        state = LISTENERS.get(port)
+    if state is None:
+        return JSONResponse({"port": port, "running": False, "peers": [],
+                             "bytes": 0, "text": "", "error": "", "done": True})
+    return JSONResponse({"port": port, "running": not state["done"],
+                         "done": state["done"], "error": state["error"],
+                         "peers": state["peers"], "bytes": state["bytes"],
+                         "text": "".join(state["text"])[-8192:]})
 
 
 @app.get("/api/tip")
