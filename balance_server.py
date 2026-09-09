@@ -1481,6 +1481,9 @@ class Station(threading.Thread):
         # Outbound diagnostics queue. The web thread appends, the station thread
         # drains and writes -- so only ONE thread ever touches the socket.
         self.tx: collections.deque = collections.deque(maxlen=16)
+        # Sockets the instrument opened to US, queued by the inbound listener.
+        self._inbox: collections.deque = collections.deque(maxlen=4)
+        self.inbound = False          # True while serving an instrument-dialled socket
 
     def queue_command(self, cmd: str) -> None:
         """Ask the station thread to send one read-only command. Rejected here
@@ -1503,6 +1506,16 @@ class Station(threading.Thread):
             except OSError as exc:
                 self._tap_note(f"--> send {cmd} FAILED: {exc}")
                 return
+
+    def attach(self, conn: socket.socket, peer: str) -> None:
+        """Hand this station a socket the instrument opened TO US.
+
+        Some instruments cannot act as a TCP server at all -- a RADWAG 4Y whose
+        Printer menu offers only 'Tcp Client' is the case that forced this: the
+        PRINT key can only dial out, so the collector has to accept instead of
+        connect. The listener calls this; run() picks the socket up on its next
+        pass and stops dialling for as long as it lasts."""
+        self._inbox.append((conn, peer))
 
     def _tap_note(self, note: str) -> None:
         """Record an outbound command in the tap, so what we sent is interleaved
@@ -1546,6 +1559,41 @@ class Station(threading.Thread):
         blocks: list[tuple[str, str, str]] = []
         meta: dict[str, str] = {}
         while not self.stop.is_set():
+            # An instrument that dialled US wins over dialling it. Checked first
+            # and on every pass, so a Tcp-Client instrument reconnecting after a
+            # power cycle is picked straight back up.
+            if self._inbox:
+                try:
+                    newsock, peer = self._inbox.popleft()
+                except IndexError:
+                    newsock = None
+                if newsock is not None:
+                    if sock is not None:
+                        try:
+                            sock.close()
+                        except OSError:
+                            pass
+                    sock = newsock
+                    self.inbound = True
+                    _enable_keepalive(sock)
+                    sock.settimeout(0.2)
+                    self._status(f"connected (inbound from {peer})")
+                    now_c = time.monotonic()
+                    next_hb = now_c + HB
+                    last_rx = now_c
+                    next_probe = now_c + PROBE_EVERY
+                    ping_fails = 0
+
+            if sock is None and self.inbound:
+                # The instrument dials us, so there is nothing to dial. Wait for
+                # it to come back rather than reporting a connect failure.
+                self._status("waiting for the instrument to reconnect (inbound mode)")
+                if time.monotonic() >= next_hb:
+                    self._touch()
+                    next_hb = time.monotonic() + HB
+                time.sleep(1)
+                continue
+
             if sock is None:
                 try:
                     sock, local_port = _connect(self.host, self.port, local_port, 4)
@@ -1734,6 +1782,88 @@ class Station(threading.Thread):
 
 STATIONS: dict[str, Station] = {}
 ST_LOCK = threading.Lock()
+
+
+# ------------------------------------------------- inbound listener ---
+#
+# Some instruments can only DIAL OUT. A RADWAG 4Y is the case in point: its
+# Peripherals -> Printer -> Port menu offers None / COM 1 / COM 2 / USB /
+# Tcp Client and nothing else, so the PRINT key cannot be served by a TCP
+# server on the balance -- the balance insists on being the client. The
+# collector therefore has to accept connections as well as make them.
+#
+# One listener serves every station. An accepted connection is matched to a
+# gateway row by SOURCE IP against its `host`, so no schema change and no extra
+# configuration is needed: enter the instrument's IP in the Add-equipment form
+# exactly as before and it works whichever way round the connection is made.
+INBOUND_PORT = int(get("BALANCE_LISTEN_PORT", str(DEFAULT_PORT)) or DEFAULT_PORT)
+INBOUND_STATE: dict = {"listening": False, "port": INBOUND_PORT, "error": "",
+                       "accepted": 0, "unmatched": []}
+
+
+def _route_inbound(conn: socket.socket, peer_ip: str, peer_port: int) -> None:
+    """Give an accepted connection to the station whose host is that IP."""
+    with ST_LOCK:
+        match = next((st for st in STATIONS.values() if st.host == peer_ip), None)
+    if match is None:
+        # Nothing configured for this address. Record it so the UI can say
+        # "something is dialling in that you have not added yet" -- far more
+        # useful than dropping it silently.
+        note = f"{peer_ip}:{peer_port}"
+        if note not in INBOUND_STATE["unmatched"]:
+            INBOUND_STATE["unmatched"].append(note)
+            del INBOUND_STATE["unmatched"][:-10]
+        try:
+            conn.close()
+        except OSError:
+            pass
+        return
+    INBOUND_STATE["accepted"] += 1
+    match.attach(conn, f"{peer_ip}:{peer_port}")
+
+
+def _inbound_listener() -> None:
+    """Accept instrument-initiated connections for the life of the process."""
+    while True:
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            # No SO_REUSEADDR: binding over another process on Windows would
+            # silently steal its traffic. A clash must be reported instead.
+            srv.bind(("0.0.0.0", INBOUND_PORT))
+            srv.listen(8)
+            srv.settimeout(1.0)
+        except OSError as exc:
+            INBOUND_STATE["listening"] = False
+            INBOUND_STATE["error"] = f"cannot listen on {INBOUND_PORT}: {exc}"
+            srv.close()
+            time.sleep(10)                 # something else holds it; keep retrying
+            continue
+        INBOUND_STATE["listening"] = True
+        INBOUND_STATE["error"] = ""
+        try:
+            while True:
+                try:
+                    conn, addr = srv.accept()
+                except socket.timeout:
+                    continue
+                except OSError as exc:
+                    INBOUND_STATE["error"] = f"accept failed: {exc}"
+                    break
+                try:
+                    _route_inbound(conn, addr[0], addr[1])
+                except Exception as exc:
+                    INBOUND_STATE["error"] = f"routing failed: {exc}"
+                    try:
+                        conn.close()
+                    except OSError:
+                        pass
+        finally:
+            INBOUND_STATE["listening"] = False
+            try:
+                srv.close()
+            except OSError:
+                pass
+        time.sleep(2)
 
 
 def sync_stations() -> None:
@@ -2464,6 +2594,9 @@ def _startup() -> None:
         except Exception as exc:
             print(f"  init_db failed: {exc}")
     sync_stations()
+    # Accept instrument-initiated connections (RADWAG 'Tcp Client' printers).
+    threading.Thread(target=_inbound_listener, daemon=True,
+                     name="inbound-listener").start()
     try:
         flush_outbox()                    # drain any backlog from a previous run
     except Exception:
@@ -2751,6 +2884,17 @@ def api_diag_listen_status(request: Request, port: int = 0):
                          "done": state["done"], "error": state["error"],
                          "peers": state["peers"], "bytes": state["bytes"],
                          "text": "".join(state["text"])[-8192:]})
+
+
+@app.get("/api/inbound")
+def api_inbound(request: Request):
+    """State of the inbound listener, for instruments that dial us."""
+    _, s = _sess(request)
+    if not s:
+        return JSONResponse({"error": "auth"}, status_code=401)
+    with ST_LOCK:
+        live = {st.host: st.inbound for st in STATIONS.values()}
+    return JSONResponse({**INBOUND_STATE, "stations_inbound": live})
 
 
 @app.get("/api/tip")
