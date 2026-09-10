@@ -1144,14 +1144,19 @@ def operator_of(text: str) -> str:
     return ""
 
 
-def weight_values(text: str) -> list[str]:
-    """Every 'Current result' value in a printout, in order, whitespace-normalised
-    (e.g. '199.9991   g' -> '199.9991 g'). A weighing prints one per stable read,
-    so a normal record carries two: the tare/first read and the final read."""
-    out = []
-    for m in re.finditer(r"(?im)^\s*Current result\s{2,}(\S.*?)\s*$", text):
-        out.append(re.sub(r"\s+", " ", m.group(1).strip()))
-    return out
+def weight_values(body: str) -> list[str]:
+    """The measured value(s) in a weight block, whitespace-normalised
+    (e.g. '199.9991   g' -> '199.9991 g').
+
+    Balance templates differ: an XA 4Y prints 'Current result   199.9991 g',
+    while an AS prints the bare value line '   1.09338 g' with no label. Handle
+    both -- the explicit 'Current result' form first, then a bare number+unit
+    line as the fallback -- so completeness never depends on one brand's wording.
+    """
+    vals = re.findall(r"(?im)^\s*Current result\s{2,}(\S.*?)\s*$", body)
+    if not vals:
+        vals = re.findall(r"(?m)^\s*([-+]?\d[\d.,]*\s*[A-Za-z%/µ]{0,4})\s*$", body)
+    return [re.sub(r"\s+", " ", v.strip()) for v in vals if v.strip()]
 
 
 def _yn(v) -> str:
@@ -1165,27 +1170,30 @@ def components_of(kind: str, blocks: list) -> dict:
     the parsed weight values, and whether the capture is structurally complete.
 
     `blocks` is the payload list built in _save: dicts with 'kind' and 'body'.
-    A weighing is complete only with a header, at least one weight, and a footer;
-    an adjustment is complete when its single adjustment block is present. An
-    incomplete record is still stored -- never dropped -- and flagged here so the
-    LIMS and the dashboard can show it as partial rather than pretend it is whole.
+    Completeness is judged on the WEIGHT BLOCKS the parser already identified --
+    not on any label text -- so a template that prints a bare value (AS) counts
+    the same as one that prints 'Current result' (XA 4Y). A weighing is complete
+    with a header, at least one weight block, and a footer; an adjustment is
+    complete when its single adjustment block is present. An incomplete record is
+    still stored -- never dropped -- and flagged here so the LIMS and the
+    dashboard show it as partial rather than pretend it is whole.
     """
     kinds = [b.get("kind") for b in blocks]
+    weight_blocks = [b for b in blocks if b.get("kind") == "weight"]
     weights: list[str] = []
-    for b in blocks:
-        if b.get("kind") in ("weight", "header", "footer"):
-            weights.extend(weight_values(b.get("body", "")))
+    for b in weight_blocks:
+        weights.extend(weight_values(b.get("body", "")))
     has_header = "header" in kinds
     has_footer = "footer" in kinds
     if kind == "adjustment":
         complete = "adjustment" in kinds
     else:
-        complete = has_header and has_footer and len(weights) >= 1
+        complete = has_header and has_footer and len(weight_blocks) >= 1
     return {
         "header": has_header,
         "footer": has_footer,
         "weights": weights,
-        "weight_count": len(weights),
+        "weight_count": len(weight_blocks),
         "block_count": len(blocks),
         "complete": complete,
     }
