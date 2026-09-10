@@ -547,11 +547,14 @@ CREATE TABLE IF NOT EXISTS public.balance_integration_data (
   finished_at   timestamptz,
   raw_text      text NOT NULL,
   blocks        jsonb NOT NULL DEFAULT '[]'::jsonb,
+  components    jsonb NOT NULL DEFAULT '{}'::jsonb,   -- header/weights/footer breakdown + complete flag
   bytes         integer NOT NULL DEFAULT 0,
   collector_id  text,
   created_at    timestamptz NOT NULL DEFAULT now(),
   UNIQUE (moxa_id, started_at, label)
 );
+ALTER TABLE public.balance_integration_data
+  ADD COLUMN IF NOT EXISTS components jsonb NOT NULL DEFAULT '{}'::jsonb;
 
 GRANT SELECT (id, host, port, name, instrument_type, equipment_id, enabled, status,
               last_seen, collector_id, created_at, updated_at)
@@ -735,13 +738,14 @@ def db_insert_session(row: dict) -> None:
         ex('INSERT INTO public.balance_integration_data '
            '(moxa_id, moxa_name, moxa_host, kind, label, inst_id, reg_no, '
            ' balance_sn, operator, started_at, finished_at, raw_text, blocks, '
-           ' bytes, collector_id) '
-           'VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) '
+           ' components, bytes, collector_id) '
+           'VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) '
            'ON CONFLICT (moxa_id, started_at, label) DO NOTHING',
            (row["moxa_id"], row["moxa_name"], row["moxa_host"], row["kind"],
             row["label"], row["inst_id"], row["reg_no"], row["balance_sn"],
             row["operator"], row["started_at"], row["finished_at"],
-            row["raw_text"], Json(row["blocks"]), row["bytes"], row["collector_id"]))
+            row["raw_text"], Json(row["blocks"]), Json(row.get("components") or {}),
+            row["bytes"], row["collector_id"]))
 
 
 def db_upsert_moxa(host: str, port: int, name: str, pw_enc: str | None,
@@ -860,11 +864,13 @@ def db_sessions(limit: int = 200) -> list[dict]:
     if _via_rest():
         return _rest("GET", "balance_integration_data",
                      {"select": "id,moxa_name,moxa_host,kind,label,inst_id,reg_no,"
-                                "balance_sn,operator,started_at,finished_at,blocks,bytes",
+                                "balance_sn,operator,started_at,finished_at,blocks,"
+                                "components,bytes",
                       "order": "finished_at.desc.nullslast",
                       "limit": str(limit)}) or []
     return q("SELECT id::text AS id, moxa_name, moxa_host, kind, label, inst_id, "
-             "reg_no, balance_sn, operator, started_at, finished_at, blocks, bytes "
+             "reg_no, balance_sn, operator, started_at, finished_at, blocks, "
+             "components, bytes "
              "FROM public.balance_integration_data "
              "ORDER BY finished_at DESC NULLS LAST, created_at DESC LIMIT %s", (limit,))
 
@@ -1136,6 +1142,53 @@ def operator_of(text: str) -> str:
         if v and v.lower() != "signature":
             return v
     return ""
+
+
+def weight_values(text: str) -> list[str]:
+    """Every 'Current result' value in a printout, in order, whitespace-normalised
+    (e.g. '199.9991   g' -> '199.9991 g'). A weighing prints one per stable read,
+    so a normal record carries two: the tare/first read and the final read."""
+    out = []
+    for m in re.finditer(r"(?im)^\s*Current result\s{2,}(\S.*?)\s*$", text):
+        out.append(re.sub(r"\s+", " ", m.group(1).strip()))
+    return out
+
+
+def _yn(v) -> str:
+    """A green tick / red cross for a present/absent component, for the UI."""
+    return "<span class=y>&#10003;</span>" if v else "<span class=n>&#10007;</span>"
+
+
+def components_of(kind: str, blocks: list) -> dict:
+    """A per-record breakdown of what the balance actually printed, for GxP
+    traceability: which structural parts arrived (header / weights / footer),
+    the parsed weight values, and whether the capture is structurally complete.
+
+    `blocks` is the payload list built in _save: dicts with 'kind' and 'body'.
+    A weighing is complete only with a header, at least one weight, and a footer;
+    an adjustment is complete when its single adjustment block is present. An
+    incomplete record is still stored -- never dropped -- and flagged here so the
+    LIMS and the dashboard can show it as partial rather than pretend it is whole.
+    """
+    kinds = [b.get("kind") for b in blocks]
+    weights: list[str] = []
+    for b in blocks:
+        if b.get("kind") in ("weight", "header", "footer"):
+            weights.extend(weight_values(b.get("body", "")))
+    has_header = "header" in kinds
+    has_footer = "footer" in kinds
+    if kind == "adjustment":
+        complete = "adjustment" in kinds
+    else:
+        complete = has_header and has_footer and len(weights) >= 1
+    return {
+        "header": has_header,
+        "footer": has_footer,
+        "weights": weights,
+        "weight_count": len(weights),
+        "block_count": len(blocks),
+        "complete": complete,
+    }
 
 
 def now_iso() -> str:
@@ -1671,12 +1724,24 @@ class Station(threading.Thread):
             except socket.timeout:
                 chunk = b""
             except OSError:
-                self._status("reconnecting")
+                # Peer closed, or the link dropped. A RADWAG Tcp Client closes
+                # the socket right after each printout, so the burst we just
+                # buffered must be FLUSHED before the socket is torn down --
+                # otherwise the print is silently lost. (This was the data-loss
+                # bug: the old code skipped straight to reconnect.)
+                blocks, meta = self._flush_buf(buf, blocks, meta)
+                buf = bytearray()
                 try:
                     sock.close()
                 except OSError:
                     pass
                 sock = None
+                if self.inbound:
+                    # Normal on-demand close. Fall through to the ready branch
+                    # with no red 'reconnecting' flicker and no 2s stall, so the
+                    # next printout's connection is picked up instantly.
+                    continue
+                self._status("reconnecting")
                 time.sleep(2)
                 continue
 
@@ -1689,19 +1754,29 @@ class Station(threading.Thread):
                     self.last_inbound_at = time.strftime("%H:%M:%S")
 
             if buf and last and (time.monotonic() - last) > self.gap:
-                whole = bytes(buf).decode(self.codepage, errors="replace")
+                blocks, meta = self._flush_buf(buf, blocks, meta)
                 buf = bytearray()
-                if self.itype == "ph_meter":
-                    for rep in split_ph_reports(whole):
-                        self._ph_capture(rep)
-                else:
-                    for text in split_bursts(whole):
-                        blocks, meta = self._one(text, blocks, meta)
         try:
             if sock:
                 sock.close()
         except OSError:
             pass
+
+    def _flush_buf(self, buf: bytearray, blocks: list, meta: dict):
+        """Decode and parse whatever is in `buf`, returning updated (blocks,
+        meta). Called both on the burst-gap timeout and when the socket closes
+        -- an on-demand instrument that closes right after printing relies on the
+        close path, so this must be reachable from both."""
+        if not buf:
+            return blocks, meta
+        whole = bytes(buf).decode(self.codepage, errors="replace")
+        if self.itype == "ph_meter":
+            for rep in split_ph_reports(whole):
+                self._ph_capture(rep)
+        else:
+            for text in split_bursts(whole):
+                blocks, meta = self._one(text, blocks, meta)
+        return blocks, meta
 
     def _ph_capture(self, text: str) -> None:
         if is_noise(text):
@@ -1774,17 +1849,20 @@ class Station(threading.Thread):
         total = sum(len(b[2].encode(CODEPAGE, "replace")) for b in blocks)
         payload = [{"seq": i, "kind": b[0], "received": b[1], "body": b[2]}
                    for i, b in enumerate(blocks)]
+        comp = components_of(kind, payload)
         row = {"moxa_id": self.mid, "moxa_name": self.name, "moxa_host": self.host,
                "kind": kind, "label": label,
                "inst_id": meta.get("inst_id") or self.equipment_id,
                "reg_no": meta.get("reg_no"), "balance_sn": meta.get("balance_sn"),
                "operator": meta.get("operator"), "started_at": blocks[0][1],
                "finished_at": blocks[-1][1], "raw_text": raw_text,
-               "blocks": payload, "bytes": total, "collector_id": COLLECTOR_ID}
+               "blocks": payload, "components": comp, "bytes": total,
+               "collector_id": COLLECTOR_ID}
         try:
             ok = outbox_submit({"op": "balance", "row": row})
-            self._status(f"saved {kind}: {label}" if ok
-                         else f"queued (DB offline): {label}")
+            tag = "" if comp["complete"] else " [PARTIAL]"
+            self._status(f"saved {kind}{tag}: {label}" if ok
+                         else f"queued (DB offline){tag}: {label}")
         except Exception as exc:
             self._status(f"save failed: {exc}")
 
@@ -1923,6 +2001,12 @@ tr.row{cursor:pointer}tr.row:hover td{background:var(--acc-soft)}
 .pill{display:inline-block;padding:2px 8px;border-radius:20px;font-size:12px;
 font-weight:600;border:1px solid var(--line)}
 .k-weighing{color:var(--acc)}.k-adjustment{color:var(--warn)}
+.pill.ok{color:var(--ok);border-color:var(--ok)}
+.pill.bad{color:var(--bad);border-color:var(--bad)}
+.cmp{font-size:11px;color:var(--mut);margin-top:3px;white-space:nowrap}
+.cmp .y{color:var(--ok);font-weight:700}.cmp .n{color:var(--bad);font-weight:700}
+.wv{display:inline-block;margin:2px 6px 2px 0;padding:2px 7px;border:1px solid var(--line);
+border-radius:6px;font:12px/1.4 ui-monospace,monospace;background:var(--bg)}
 .mono{font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace}
 pre{margin:6px 0 0;padding:11px 13px;background:var(--bg);border:1px solid var(--line);
 border-radius:8px;overflow-x:auto;white-space:pre}
@@ -2354,22 +2438,38 @@ def render(csrf: str) -> str:
       <a href=# onclick="location.reload();return false" style=color:var(--acc)>
       &nbsp;Reload to view</a></div>
       <table>
-      <tr><th>When<th>Type<th>Label<th>MOXA<th>Operator<th>Blocks<th>Bytes</tr>"""]
+      <tr><th>When<th>Type<th>Label<th>MOXA<th>Operator<th>Captured<th>Bytes</tr>"""]
     if not rows:
         r_html.append("<tr><td colspan=7 class=mut>No records yet. "
                       "Print a header, weights and a footer on the balance.</tr>")
     for r in rows:
         blocks = r["blocks"] or []
+        comp = r.get("components") or {}
+        if not comp:                       # old rows: derive on the fly
+            comp = components_of(r.get("kind", ""), blocks)
         when = esc(str(r["finished_at"] or "")[:19].replace("T", " "))
         search = " ".join(str(x or "").lower() for x in
                           (r["label"], r["operator"], r["inst_id"],
                            r["reg_no"], r["balance_sn"], r["moxa_name"]))
+        weights = comp.get("weights") or []
+        wc = comp.get("weight_count", len(weights))
+        is_adj = r["kind"] == "adjustment"
+        ok = bool(comp.get("complete"))
+        status = ("<span class='pill ok'>Complete</span>" if ok
+                  else "<span class='pill bad'>Partial</span>")
+        if is_adj:
+            cmp_line = "Adjustment block"
+        else:
+            cmp_line = (f"Header {_yn(comp.get('header'))} &middot; "
+                        f"{wc} weight{'s' if wc != 1 else ''} &middot; "
+                        f"Footer {_yn(comp.get('footer'))}")
         r_html.append(
             f"<tr class=row data-id={esc(r['id'])} data-kind={esc(r['kind'])} "
             f"data-search=\"{esc(search)}\"><td class=mono>{when}"
             f"<td><span class='pill k-{esc(r['kind'])}'>{esc(r['kind'])}</span>"
             f"<td class=mono>{esc(r['label'])}<td>{esc(r['moxa_name'])}"
-            f"<td>{esc(r['operator'] or '-')}<td>{len(blocks)}"
+            f"<td>{esc(r['operator'] or '-')}"
+            f"<td>{status}<div class=cmp>{cmp_line}</div>"
             f"<td class=mono>{r['bytes']}</tr>")
         sub = [f"<tr id=sub-{esc(r['id'])} class='sub-row hide'><td colspan=7><div class=sub>"]
         if r["inst_id"] or r["reg_no"] or r["balance_sn"]:
@@ -2377,9 +2477,29 @@ def render(csrf: str) -> str:
                        f"<b>{esc(r['inst_id'] or '-')}</b> &middot; Reg No "
                        f"<b>{esc(r['reg_no'] or '-')}</b> &middot; Balance S/N "
                        f"<b>{esc(r['balance_sn'] or '-')}</b></div>")
+        # Completeness + parsed weights, stated plainly for the reviewer.
+        if not is_adj:
+            wv = ("".join(f"<span class=wv>{esc(w)}</span>" for w in weights)
+                  if weights else "<span class=mut>none parsed</span>")
+            warn = ("" if ok else
+                    "<div class=mut style='color:var(--bad);margin-top:6px'>"
+                    "&#9888; Partial capture &mdash; a complete weighing needs a header, "
+                    "at least one weight, and a footer. Do not use for release without "
+                    "review.</div>")
+            sub.append(
+                f"<div style='margin:4px 0 12px;padding:8px 11px;border:1px solid var(--line);"
+                f"border-radius:8px'><div style=margin-bottom:5px>{status} "
+                f"<span class=mut>&nbsp;Header {_yn(comp.get('header'))} &middot; "
+                f"Footer {_yn(comp.get('footer'))} &middot; {wc} weight value"
+                f"{'s' if wc != 1 else ''}</span></div>"
+                f"<div><span class=mut style=font-size:12px>Weights captured:</span><br>{wv}</div>"
+                f"{warn}</div>")
         for b in blocks:
+            k = b.get("kind", "")
+            nice = {"header": "Header", "weight": "Weight", "footer": "Footer",
+                    "adjustment": "Adjustment"}.get(k, k)
             sub.append(f"<div class=blk><span class=copy data-copy>copy</span>"
-                       f"<b>{b.get('seq', 0) + 1}. {esc(b.get('kind'))}</b> "
+                       f"<b>{b.get('seq', 0) + 1}. {esc(nice)}</b> "
                        f"<span class=mut>{esc(str(b.get('received', ''))[:19].replace('T', ' '))}"
                        f"</span><pre class=mono>{esc(b.get('body'))}</pre></div>")
         sub.append("</div></tr>")
