@@ -1413,6 +1413,8 @@ def outbox_submit(ev: dict) -> bool:
 # Liveness-watchdog timings (module-level so tests can tune them).
 STATION_RX_IDLE = 20.0        # start pinging after this much silence
 STATION_PROBE_EVERY = 10.0    # ping cadence while idle
+READY_PROBE_EVERY = 5.0       # ping cadence while inbound-idle (on-demand); two
+                              # misses (~10s) flips a pulled cable to Disconnected
 
 
 def _ping_ok(host: str) -> bool:
@@ -1648,10 +1650,22 @@ class Station(threading.Thread):
 
             if sock is None and self.inbound:
                 # The instrument dials us and closes the socket after each print,
-                # so an idle gap is NORMAL and healthy -- not a fault. Report it as
-                # a ready/on-demand state (mapped green by gateway_view), with the
-                # time of the last printout so the user can see it is live.
-                if self.last_inbound_at:
+                # so an idle gap is normally healthy. BUT idle-because-on-demand
+                # and idle-because-the-cable-is-unplugged look identical from here
+                # -- there is no live socket to fail. So actively ICMP-ping the
+                # instrument while idle: if it stops answering, it is genuinely
+                # gone and must show Disconnected, never a false 'Ready'.
+                now_m = time.monotonic()
+                if now_m >= next_probe:
+                    next_probe = now_m + READY_PROBE_EVERY
+                    if _ping_ok(self.host):
+                        ping_fails = 0
+                    else:
+                        ping_fails += 1
+                if ping_fails >= 2:
+                    # Unreachable: cable pulled, switch/port down, or powered off.
+                    self._status("disconnected")
+                elif self.last_inbound_at:
                     self._status(f"ready (on-demand): last printout at "
                                  f"{self.last_inbound_at}, awaiting next")
                 else:
