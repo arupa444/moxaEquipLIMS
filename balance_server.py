@@ -1484,6 +1484,7 @@ class Station(threading.Thread):
         # Sockets the instrument opened to US, queued by the inbound listener.
         self._inbox: collections.deque = collections.deque(maxlen=4)
         self.inbound = False          # True while serving an instrument-dialled socket
+        self.last_inbound_at = ""     # local HH:MM:SS of the last inbound printout
 
     def queue_command(self, cmd: str) -> None:
         """Ask the station thread to send one read-only command. Rejected here
@@ -1585,9 +1586,15 @@ class Station(threading.Thread):
                     ping_fails = 0
 
             if sock is None and self.inbound:
-                # The instrument dials us, so there is nothing to dial. Wait for
-                # it to come back rather than reporting a connect failure.
-                self._status("waiting for the instrument to reconnect (inbound mode)")
+                # The instrument dials us and closes the socket after each print,
+                # so an idle gap is NORMAL and healthy -- not a fault. Report it as
+                # a ready/on-demand state (mapped green by gateway_view), with the
+                # time of the last printout so the user can see it is live.
+                if self.last_inbound_at:
+                    self._status(f"ready (on-demand): last printout at "
+                                 f"{self.last_inbound_at}, awaiting next")
+                else:
+                    self._status("ready (on-demand): awaiting first printout")
                 if time.monotonic() >= next_hb:
                     self._touch()
                     next_hb = time.monotonic() + HB
@@ -1678,6 +1685,8 @@ class Station(threading.Thread):
                 buf.extend(chunk)
                 last = time.monotonic()
                 last_rx = last
+                if self.inbound:
+                    self.last_inbound_at = time.strftime("%H:%M:%S")
 
             if buf and last and (time.monotonic() - last) > self.gap:
                 whole = bytes(buf).decode(self.codepage, errors="replace")
@@ -2218,6 +2227,12 @@ def gateway_view(status: str | None, last_seen) -> tuple[str, str, str]:
         return "Disconnected", GATEWAY_DISCONNECTED_MSG, "var(--bad)"
     if low.startswith(("refused", "busy")):
         return "Not ready", (status or "").strip(), "var(--warn)"
+    # On-demand instruments (RADWAG Tcp Client) close the socket between prints.
+    # An idle 'ready' gap is the healthy steady state, so show it green -- the
+    # detail line still carries "last printout at HH:MM:SS" so the user sees it
+    # is live, not stuck.
+    if low.startswith("ready"):
+        return "Ready", (status or "").strip(), "var(--ok)"
     if low.startswith(("connected", "saved", "queued", "idle")):
         return "Connected", (status or "").strip(), "var(--ok)"
     return (status or "unknown").strip(), (status or "").strip(), "var(--warn)"
